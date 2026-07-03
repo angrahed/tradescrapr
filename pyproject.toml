@@ -1,0 +1,38 @@
+[project]
+name = "tradescrapr"
+version = "0.1.0"
+description = "UN Comtrade scraping toolkit: targeted long-run scrapes + monthly release monitor"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32",
+    "polars>=1.0",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+tradescrapr = "tradescrapr.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "responses>=0.25",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["uv_build>=0.10,<0.11"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

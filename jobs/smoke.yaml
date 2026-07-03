@@ -1,0 +1,14 @@
+# Tiny validation job: 2 small reporters x 1 year x TOTAL x 2 flows = 4 calls.
+# Run this end-to-end before trusting long jobs.
+name: smoke
+dataset: final
+type: C
+freq: A
+classification: HS
+reporters: [ALB, ISL]
+partners: all
+flows: [M, X]
+commodities:
+  codes: [TOTAL]
+periods: "2022"
+include_desc: false

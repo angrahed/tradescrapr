@@ -1,0 +1,46 @@
+# tradescrapr configuration. Every key is optional; defaults shown.
+# Precedence: CLI flag > TRADESCRAPR_* env var > this file > built-in default.
+# Secrets never live here — the API key goes in .env (COMTRADE_KEY).
+
+tier: free                    # free | premium
+
+api:
+  rps: null                   # calls/sec throttle; null -> tier default (free 1.0, premium 4.0)
+  max_records: null           # per-call record cap; null -> tier default (free 100_000, premium 250_000)
+  timeout_s: 120
+
+quota:
+  daily_budget: null          # null -> tier default (free 450 of 500 headroom, premium unlimited)
+  reset_time: "00:00"         # daily quota reset instant
+  reset_tz: "UTC"
+
+retry:
+  transport_retries: 5        # urllib3 Retry inside one session.get()
+  backoff_factor: 1.5
+  task_max_attempts: 5        # task goes 'dead' after this many failed attempts
+  backoff_base_s: 5
+  backoff_cap_s: 300
+  max_split_depth: 8
+  stale_minutes: 120          # in_progress tasks older than this are reclaimed
+
+planner:
+  max_cmd_codes_per_call: 100
+  combine_flows: false        # true = one task covers all flows (halves calls, doubles truncation risk)
+
+paths:
+  data: data/raw/comtrade
+  state_db: state/tradescrapr.sqlite3
+  refs: state/refs
+  logs: logs
+
+monitor:
+  datasets: [final]           # final | tariffline (list)
+  type: C
+  freq: M
+  classification: HS
+  flows: [M, X]
+  cmd_level: 6
+  breakdown: classic          # classic = totals over partner2/customs/transport-mode; full = every breakdown (~10x rows)
+  start_period: "202401"      # ignore releases for periods older than this on first run
+  wait_for_quota: false       # false = exit when quota exhausted; next cron run resumes
+  reporters: null             # optional list restriction (useful for drills); null = all

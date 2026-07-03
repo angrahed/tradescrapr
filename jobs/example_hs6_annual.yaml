@@ -1,0 +1,15 @@
+# Example targeted job: EU3 annual HS6 imports+exports, all partners, 2015-2024.
+# ~60 tasks; safely inside one free-tier day unless big reporters split.
+name: eu3_hs6_annual
+dataset: final
+type: C
+freq: A
+classification: HS
+reporters: [DEU, FRA, ITA]
+partners: all
+flows: [M, X]
+commodities:
+  level: 6
+periods: "2015:2024"
+include_desc: false
+# use_availability: true   # default; only plans reporter-periods that exist per getDA
