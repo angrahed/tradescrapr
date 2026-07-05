@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import fcntl
+import os
 import re
 import select
 import sys
@@ -454,8 +455,16 @@ def _cbreak(stream):
 
 
 def _read_key(timeout: float) -> str:
+    """One raw byte from stdin, or "" on timeout. Reads the fd directly —
+    sys.stdin.read(1) would buffer burst input (escape sequences, pastes)
+    where select() can't see it."""
     ready, _, _ = select.select([sys.stdin], [], [], timeout)
-    return sys.stdin.read(1) if ready else ""
+    if not ready:
+        return ""
+    data = os.read(sys.stdin.fileno(), 1)
+    if not data:
+        raise EOFError("stdin closed")
+    return data.decode(errors="replace")
 
 
 def cmd_ui(cfg: Config, *, refresh: float = 2.0, once: bool = False) -> int:
@@ -483,7 +492,7 @@ def cmd_ui(cfg: Config, *, refresh: float = 2.0, once: bool = False) -> int:
                 key = _read_key(refresh)
                 if key in ("q", "Q"):
                     return 0
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         return 0
     finally:
         store.close()

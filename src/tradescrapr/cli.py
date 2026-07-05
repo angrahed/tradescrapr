@@ -45,7 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging on console")
     p.add_argument("--root", type=Path, default=None, help="project root (default: auto-detect)")
     p.add_argument("--tier", choices=["free", "premium"], default=None, help="override tier")
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command", required=False)
+
+    sub.add_parser(
+        "new", help="interactively build, save, and plan a job spec (default in a terminal)"
+    )
 
     sp = sub.add_parser("plan", help="expand a YAML job spec into a job + tasks")
     sp.add_argument("spec", type=Path, help="path to job spec YAML")
@@ -115,7 +119,16 @@ def _load(args: argparse.Namespace) -> Config:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command is None:
+        # Bare `tradescrapr` in a terminal opens the interactive job builder;
+        # anywhere else (pipes, cron) keep the old help-and-exit behaviour.
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            args.command = "new"
+        else:
+            parser.print_help()
+            return 2
     try:
         cfg = _load(args)
     except ConfigError as e:
@@ -124,11 +137,15 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(
         cfg.paths.logs,
         args.verbose,
-        console_output=args.command not in ("ui", "dashboard"),
+        console_output=args.command not in ("ui", "dashboard", "new"),
     )
     log.debug("root=%s tier=%s", cfg.paths.root, cfg.tier)
 
     try:
+        if args.command == "new":
+            from .wizard_ui import cmd_new
+
+            return cmd_new(cfg)
         if args.command == "plan":
             from .jobs.targeted import cmd_plan
 

@@ -12,7 +12,9 @@ unattended operation, with two modes:
    re-published) monthly data via the free availability endpoint and scrapes
    exactly that, at full detail.
 
-Plus a live terminal dashboard (`tradescrapr ui`) to watch either one work.
+Plus a full-screen interactive job builder (just run `tradescrapr`) to pick
+exactly what to download, and a live terminal dashboard (`tradescrapr ui`) to
+watch it work.
 
 **Key properties**
 
@@ -110,6 +112,22 @@ uv run tradescrapr status                            # expect 4/4 done
 
 You should find four parquet files with manifests under
 `data/raw/comtrade/final/freq=A/period=2022/`.
+
+## Interactive job builder
+
+The quickest way to set up a download is the full-screen interactive form —
+just start tradescrapr:
+
+```bash
+uv run tradescrapr        # in a terminal, opens the job builder
+uv run tradescrapr new    # same thing, explicit
+```
+
+Pick reporters/partners/commodities from searchable lists (`space` toggles,
+`*` selects all), set periods and flows, and watch the live task/quota
+estimate. `s` saves the spec to `jobs/<name>.yaml`, plans the job, and then
+offers to start the worker or open the dashboard. The saved YAML is a normal
+job spec — everything below applies to it.
 
 ## Targeted mode
 

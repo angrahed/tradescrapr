@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..availability import fetch_availability
@@ -15,7 +16,18 @@ from ..state import Store
 log = logging.getLogger(__name__)
 
 
-def cmd_plan(cfg: Config, spec_path: Path, *, dry_run: bool = False) -> int:
+@dataclass(frozen=True)
+class PlanResult:
+    job_id: str
+    n_tasks: int
+    est_days: str  # "~2 day(s)" or "n/a (unlimited)"
+    sample: tuple[str, ...]  # first few task descriptions
+    created: bool  # job row newly created (False on dry-run or re-plan)
+    added: int  # tasks inserted (0 on dry-run)
+    dry_run: bool
+
+
+def plan_spec(cfg: Config, spec_path: Path, *, dry_run: bool = False) -> PlanResult:
     spec = load_spec(spec_path)
     client = ComtradeClient(cfg)
     refs = Refs(client, cfg.paths.refs)
@@ -35,19 +47,10 @@ def cmd_plan(cfg: Config, spec_path: Path, *, dry_run: bool = False) -> int:
 
     budget = cfg.quota.daily_budget
     est_days = f"~{max(1, round(len(tasks) / budget))} day(s)" if budget else "n/a (unlimited)"
-    print(f"job:        {job_id}")
-    print(f"tasks:      {len(tasks)} (>= as many API calls; truncation splits add more)")
-    print(f"quota cost: {est_days} at {budget or 'unlimited'} calls/day")
-    if tasks:
-        print("sample:")
-        for t in tasks[:3]:
-            print(f"  - {t.describe()}")
-        if len(tasks) > 3:
-            print(f"  ... and {len(tasks) - 3} more")
+    sample = tuple(t.describe() for t in tasks[:3])
 
     if dry_run:
-        print("(dry run: nothing written)")
-        return 0
+        return PlanResult(job_id, len(tasks), est_days, sample, False, 0, dry_run=True)
 
     store = Store(cfg.paths.state_db)
     try:
@@ -55,9 +58,33 @@ def cmd_plan(cfg: Config, spec_path: Path, *, dry_run: bool = False) -> int:
         added = store.add_tasks(job_id, tasks)
     finally:
         store.close()
-    if created:
-        print(f"created job {job_id} with {added} tasks")
+    return PlanResult(job_id, len(tasks), est_days, sample, created, added, dry_run=False)
+
+
+def cmd_plan(cfg: Config, spec_path: Path, *, dry_run: bool = False) -> int:
+    res = plan_spec(cfg, spec_path, dry_run=dry_run)
+
+    budget = cfg.quota.daily_budget
+    print(f"job:        {res.job_id}")
+    print(f"tasks:      {res.n_tasks} (>= as many API calls; truncation splits add more)")
+    print(f"quota cost: {res.est_days} at {budget or 'unlimited'} calls/day")
+    if res.sample:
+        print("sample:")
+        for line in res.sample:
+            print(f"  - {line}")
+        if res.n_tasks > 3:
+            print(f"  ... and {res.n_tasks - 3} more")
+
+    if res.dry_run:
+        print("(dry run: nothing written)")
+        return 0
+
+    if res.created:
+        print(f"created job {res.job_id} with {res.added} tasks")
     else:
-        print(f"job {job_id} already exists; {added} new task(s) added (re-plan is idempotent)")
-    print(f"next: uv run tradescrapr run --job {job_id}")
+        print(
+            f"job {res.job_id} already exists; "
+            f"{res.added} new task(s) added (re-plan is idempotent)"
+        )
+    print(f"next: uv run tradescrapr run --job {res.job_id}")
     return 0
