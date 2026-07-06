@@ -8,7 +8,10 @@ without a TTY.
 
 from __future__ import annotations
 
+import csv
 import enum
+import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +26,55 @@ from .refs import Refs, _partner_code, _partner_iso3
 FLOW_CHOICES = ("M", "X", "RM", "RX")
 FLOW_LABELS = {"M": "imports", "X": "exports", "RM": "re-imports", "RX": "re-exports"}
 CMD_MODES = ("total", "level2", "level4", "level6", "codes")
+IMPORTABLE_PICKERS = {"reporters", "partners", "commodities"}
+_IMPORT_EXTENSIONS = {".txt", ".csv", ".json"}
+_IDENT_SPLIT_RE = re.compile(r"[\s,;]+")
+_HEADER_WORDS = {
+    "code",
+    "codes",
+    "country",
+    "countries",
+    "country_code",
+    "id",
+    "ids",
+    "iso3",
+    "partner",
+    "partner_code",
+    "product",
+    "product_code",
+    "product_codes",
+    "reporter",
+    "reporter_code",
+    "commodity",
+    "commodity_code",
+    "hs_code",
+    "cmd_code",
+    "cmdcode",
+}
+_JSON_LIST_KEYS = (
+    "codes",
+    "items",
+    "reporters",
+    "countries",
+    "partners",
+    "commodities",
+    "products",
+    "productcodes",
+)
+_JSON_VALUE_KEYS = (
+    "code",
+    "id",
+    "iso3",
+    "reporter",
+    "reportercode",
+    "partner",
+    "partnercode",
+    "commodity",
+    "commoditycode",
+    "cmdcode",
+    "product",
+    "productcode",
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +146,9 @@ class PickerState:
     cursor: int = 0
     allow_all: bool = True
 
+    def can_import(self) -> bool:
+        return self.field_key in IMPORTABLE_PICKERS
+
     def visible(self) -> list[PickItem]:
         if not self.query:
             return self.items
@@ -101,7 +156,7 @@ class PickerState:
         return [it for it in self.items if q in it.search]
 
     def handle_key(self, key: str) -> str | None:
-        """Returns "done", "cancel", or None (picker stays open)."""
+        """Returns "done", "cancel", "import", or None (picker stays open)."""
         vis = self.visible()
         if key == "up":
             self.cursor = max(0, self.cursor - 1)
@@ -125,6 +180,8 @@ class PickerState:
             return "done"
         elif key == "esc":
             return "cancel"
+        elif key == "I" and self.can_import():
+            return "import"
         elif len(key) == 1 and key.isprintable():
             self.query += key.lower()
             self.cursor = 0
@@ -192,6 +249,143 @@ def commodity_items(refs: Refs, cl_code: str) -> list[PickItem]:
 
 
 # ---------------------------------------------------------------------------
+# Picker file import
+# ---------------------------------------------------------------------------
+
+
+def _clean_identifier(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (str, int)):
+        return None
+    s = str(value).strip().strip("\"'")
+    return s or None
+
+
+def _normalise_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+
+def _looks_like_header(value: str) -> bool:
+    cleaned = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return cleaned in _HEADER_WORDS
+
+
+def _parse_txt_import(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError as e:
+        raise ConfigError(f"cannot read import file {path}: {e.strerror or e}") from e
+    return [tok for tok in (_clean_identifier(t) for t in _IDENT_SPLIT_RE.split(text)) if tok]
+
+
+def _parse_csv_import(path: Path) -> list[str]:
+    values: list[str] = []
+    try:
+        with path.open(newline="", encoding="utf-8-sig") as f:
+            for row in csv.reader(f):
+                for cell in row:
+                    ident = _clean_identifier(cell)
+                    if ident:
+                        values.append(ident)
+                        break
+    except OSError as e:
+        raise ConfigError(f"cannot read import file {path}: {e.strerror or e}") from e
+    except csv.Error as e:
+        raise ConfigError(f"invalid CSV import file {path}: {e}") from e
+    if values and _looks_like_header(values[0]):
+        values = values[1:]
+    return values
+
+
+def _json_sequence(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        by_key = {_normalise_key(k): v for k, v in payload.items()}
+        for key in _JSON_LIST_KEYS:
+            value = by_key.get(key)
+            if isinstance(value, list):
+                return value
+    raise ConfigError("JSON import must be an array or an object containing an array of codes")
+
+
+def _json_object_identifier(row: dict[str, Any]) -> str | None:
+    by_key = {_normalise_key(k): v for k, v in row.items()}
+    for key in _JSON_VALUE_KEYS:
+        ident = _clean_identifier(by_key.get(key))
+        if ident:
+            return ident
+    return None
+
+
+def _parse_json_import(path: Path) -> list[str]:
+    try:
+        with path.open(encoding="utf-8-sig") as f:
+            payload = json.load(f)
+    except OSError as e:
+        raise ConfigError(f"cannot read import file {path}: {e.strerror or e}") from e
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"invalid JSON import file {path}: {e}") from e
+
+    values: list[str] = []
+    for row in _json_sequence(payload):
+        ident = _json_object_identifier(row) if isinstance(row, dict) else _clean_identifier(row)
+        if ident:
+            values.append(ident)
+    return values
+
+
+def parse_import_file(path: Path) -> list[str]:
+    path = path.expanduser()
+    ext = path.suffix.lower()
+    if ext not in _IMPORT_EXTENSIONS:
+        allowed = ", ".join(sorted(_IMPORT_EXTENSIONS))
+        raise ConfigError(f"unsupported import file extension {ext!r} (use {allowed})")
+    if ext == ".txt":
+        values = _parse_txt_import(path)
+    elif ext == ".csv":
+        values = _parse_csv_import(path)
+    else:
+        values = _parse_json_import(path)
+    if not values:
+        raise ConfigError(f"import file {path} contains no identifiers")
+    return values
+
+
+def resolve_imported_selection(picker: PickerState, refs: Refs, identifiers: list[str]) -> set[str]:
+    if not picker.can_import():
+        raise ConfigError(f"{picker.title} does not support file import")
+
+    valid = {it.code for it in picker.items}
+    resolved: list[str] = []
+    invalid: list[str] = []
+    for ident in identifiers:
+        try:
+            if picker.field_key == "reporters":
+                code = refs.reporter_code(ident)
+            elif picker.field_key == "partners":
+                code = refs.partner_code(ident)
+            else:
+                code = str(ident).strip()
+        except ConfigError:
+            invalid.append(ident)
+            continue
+        if code in valid:
+            resolved.append(code)
+        else:
+            invalid.append(ident)
+
+    if invalid:
+        shown = ", ".join(repr(v) for v in invalid[:5])
+        extra = f" +{len(invalid) - 5}" if len(invalid) > 5 else ""
+        raise ConfigError(f"import contains unknown {picker.title}: {shown}{extra}")
+    if not resolved:
+        raise ConfigError(f"import file contains no {picker.title}")
+    return set(resolved)
+
+
+# ---------------------------------------------------------------------------
 # Form state
 # ---------------------------------------------------------------------------
 
@@ -200,6 +394,7 @@ class Mode(enum.Enum):
     FORM = "form"
     EDIT_TEXT = "edit_text"
     PICKER = "picker"
+    IMPORT_PATH = "import_path"
     CONFIRM_OVERWRITE = "confirm_overwrite"
     DONE = "done"
 
@@ -208,6 +403,7 @@ class Action(enum.Enum):
     NONE = "none"
     QUIT = "quit"
     SAVE = "save"
+    IMPORT = "import"
 
 
 @dataclass
@@ -277,6 +473,8 @@ class FormState:
         if self.mode is Mode.PICKER:
             self._handle_picker_key(key)
             return Action.NONE
+        if self.mode is Mode.IMPORT_PATH:
+            return self._handle_import_key(key)
         if self.mode is Mode.CONFIRM_OVERWRITE:
             self.mode = Mode.FORM
             return Action.SAVE if key in ("y", "Y") else Action.NONE
@@ -386,6 +584,43 @@ class FormState:
             self.error = None
         elif outcome == "done":
             self._commit_picker()
+        elif outcome == "import":
+            self.edit_buffer = ""
+            self.mode = Mode.IMPORT_PATH
+            self.error = None
+
+    def _handle_import_key(self, key: str) -> Action:
+        if key == "esc":
+            self.mode = Mode.PICKER
+            self.edit_buffer = ""
+            self.error = None
+        elif key == "enter":
+            return Action.IMPORT
+        elif key == "backspace":
+            self.edit_buffer = self.edit_buffer[:-1]
+            self.error = None
+        elif key == "space":
+            self.edit_buffer += " "
+            self.error = None
+        elif len(key) == 1 and key.isprintable():
+            self.edit_buffer += key
+            self.error = None
+        return Action.NONE
+
+    def import_picker_file(self, path: Path, refs: Refs) -> None:
+        p = self.picker
+        if p is None:
+            raise ConfigError("no picker is open")
+        selected = resolve_imported_selection(p, refs, parse_import_file(path))
+        p.selected = selected
+        p.all_selected = False
+        p.query = ""
+        p.cursor = 0
+        if p.field_key == "commodities":
+            self.values["commodities"]["mode"] = "codes"
+        self.edit_buffer = ""
+        self.mode = Mode.PICKER
+        self.error = None
 
     def _commit_picker(self) -> None:
         p = self.picker

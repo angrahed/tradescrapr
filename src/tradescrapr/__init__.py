@@ -4,4 +4,4 @@ Two modes: targeted long-running scrape jobs (`tradescrapr plan` + `tradescrapr 
 and a monthly release monitor (`tradescrapr monitor`) meant for cron.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

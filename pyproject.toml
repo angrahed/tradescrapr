@@ -1,6 +1,6 @@
 [project]
 name = "tradescrapr"
-version = "0.1.0"
+version = "0.2.0"
 description = "UN Comtrade scraping toolkit: targeted long-run scrapes + monthly release monitor"
 readme = "README.md"
 requires-python = ">=3.12"

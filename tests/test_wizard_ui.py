@@ -67,6 +67,17 @@ def test_render_picker(cfg, refs):
     out = _render(state, refs)
     assert "reporters" in out and "0 selected" in out
     assert "ALB" in out and "DEU" not in out  # search query "al" filters the list
+    assert "import" in out
+
+
+def test_render_import_path(cfg, refs):
+    state = FormState.initial(cfg.paths.root / "jobs")
+    state.mode = Mode.PICKER
+    state.picker = PickerState(title="reporters", field_key="reporters", items=reporter_items(refs))
+    state.handle_key("I", lambda _key: state.picker)
+    state.edit_buffer = "countries.txt"
+    out = _render(state, refs)
+    assert "countries.txt" in out and "import" in out and "cancel" in out
 
 
 def test_render_done_and_too_small(cfg, refs):
@@ -150,4 +161,45 @@ def test_cmd_new_full_flow_offline(cfg, refs):
         assert len(jobs) == 1 and jobs[0].job_id == spec.job_id() and jobs[0].total == 6
     finally:
         store.close()
+    assert "job planned" in out
+
+
+def test_cmd_new_imports_reporters_from_file(cfg, refs):
+    import_file = cfg.paths.root / "reporters.txt"
+    import_file.write_text("DEU\nALB\n")
+    keys = [
+        "enter",
+        *"imported",
+        "enter",  # name
+        "down",
+        "down",
+        "down",
+        "down",
+        "down",  # -> reporters
+        "enter",
+        "I",
+        *str(import_file),
+        "enter",  # import file
+        "enter",  # commit picker
+        "down",
+        "down",
+        "down",
+        "down",  # -> periods
+        "enter",
+        *"2022",
+        "enter",
+        "down",
+        "down",
+        "down",  # -> use availability
+        "enter",
+        "s",
+        "q",
+    ]
+    rc, out = _run(cfg, keys)
+    assert rc == 0
+
+    spec_path = cfg.paths.root / "jobs" / "imported.yaml"
+    spec = load_spec(spec_path)
+    assert spec.reporters == ("ALB", "DEU")
+    assert spec.periods == ("2022",)
     assert "job planned" in out

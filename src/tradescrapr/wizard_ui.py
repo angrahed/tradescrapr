@@ -25,7 +25,7 @@ from rich.text import Text
 from . import __version__
 from .client import ComtradeClient
 from .config import Config
-from .errors import TradescraprError
+from .errors import ConfigError, TradescraprError
 from .jobs.targeted import PlanResult, plan_spec
 from .quota import QuotaLedger
 from .refs import Refs
@@ -390,12 +390,6 @@ def _result_panel(
 
 
 def _footer(state: FormState) -> Text:
-    if state.error:
-        return Text(f" ✘ {state.error}", style=f"bold {BAD}")
-    if state.mode is Mode.CONFIRM_OVERWRITE:
-        name = str(state.values["name"]).strip()
-        return Text(f" overwrite jobs/{name}.yaml? y / n", style=f"bold {WARN}")
-
     def hints(*pairs: tuple[str, str]) -> Text:
         t = Text()
         for k, label in pairs:
@@ -403,9 +397,34 @@ def _footer(state: FormState) -> Text:
             t.append(f"{label}  ", style=DIM)
         return t
 
+    if state.mode is Mode.IMPORT_PATH:
+        t = Text()
+        if state.error:
+            t.append(f" ✘ {state.error}  ", style=f"bold {BAD}")
+        t.append(" path ", style=f"bold {ACCENT}")
+        t.append(state.edit_buffer, style=f"bold {ACCENT}")
+        t.append("▊", style=ACCENT)
+        t.append("  ")
+        t.append(hints(("⏎", "import"), ("esc", "cancel")))
+        return t
+    if state.error:
+        return Text(f" ✘ {state.error}", style=f"bold {BAD}")
+    if state.mode is Mode.CONFIRM_OVERWRITE:
+        name = str(state.values["name"]).strip()
+        return Text(f" overwrite jobs/{name}.yaml? y / n", style=f"bold {WARN}")
     if state.mode is Mode.EDIT_TEXT:
         return hints(("type", "to edit"), ("⏎", "commit"), ("esc", "cancel"))
     if state.mode is Mode.PICKER:
+        if state.picker is not None and state.picker.can_import():
+            return hints(
+                ("↑↓", "move"),
+                ("space", "toggle"),
+                ("*", "all"),
+                ("I", "import"),
+                ("⏎", "done"),
+                ("esc", "cancel"),
+                ("type", "to search"),
+            )
         return hints(
             ("↑↓", "move"),
             ("space", "toggle"),
@@ -454,7 +473,7 @@ def render_wizard(
     body_h = height - 5
     if state.mode is Mode.DONE:
         layout["body"].update(_result_panel(result, plan_error, saved_path, has_key))
-    elif state.mode is Mode.PICKER and state.picker is not None:
+    elif state.mode in (Mode.PICKER, Mode.IMPORT_PATH) and state.picker is not None:
         layout["body"].update(_picker_panel(state.picker, body_h))
     else:
         layout["body"].split_row(
@@ -565,6 +584,16 @@ def cmd_new(
                 action = state.handle_key(key, lambda fk: make_picker(fk, state.values, refs))
                 if action is Action.QUIT:
                     return 0
+                if action is Action.IMPORT:
+                    raw_path = state.edit_buffer.strip()
+                    if not raw_path:
+                        state.error = "import path is required"
+                        continue
+                    try:
+                        state.import_picker_file(Path(raw_path), refs)
+                    except ConfigError as e:
+                        state.error = str(e)
+                    continue
                 if action is Action.SAVE:
                     jobs_dir.mkdir(parents=True, exist_ok=True)
                     saved_path = jobs_dir / f"{state.values['name'].strip()}.yaml"

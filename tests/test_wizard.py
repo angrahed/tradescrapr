@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from tradescrapr.errors import ConfigError
 from tradescrapr.planner import load_spec
 from tradescrapr.wizard import (
     Action,
@@ -16,8 +17,10 @@ from tradescrapr.wizard import (
     dump_spec_yaml,
     estimate,
     flow_items,
+    parse_import_file,
     partner_items,
     reporter_items,
+    resolve_imported_selection,
 )
 
 
@@ -185,6 +188,10 @@ def test_picker_items_tolerate_missing_text(refs):
 
 def test_picker_search_and_toggle(refs):
     p = PickerState(title="reporters", field_key="reporters", items=reporter_items(refs))
+    assert p.handle_key("i") is None
+    assert p.query == "i"
+    p.handle_key("backspace")
+    assert p.handle_key("I") == "import"
     p.handle_key("a")
     p.handle_key("l")
     p.handle_key("b")
@@ -250,6 +257,102 @@ def test_make_picker_failure_sets_error(tmp_path):
     _goto(s, "reporters")
     s.handle_key("enter", lambda _key: None)
     assert s.mode is Mode.FORM and "refs refresh" in s.error
+
+
+# ---------------------------------------------------------------------------
+# picker file import
+# ---------------------------------------------------------------------------
+
+
+def test_parse_import_file_txt_csv_json(tmp_path):
+    txt = tmp_path / "codes.txt"
+    txt.write_text("DEU\nALB, 352;010121\n")
+    assert parse_import_file(txt) == ["DEU", "ALB", "352", "010121"]
+
+    csv = tmp_path / "countries.csv"
+    csv.write_text("code,name\nDEU,Germany\nALB,Albania\n")
+    assert parse_import_file(csv) == ["DEU", "ALB"]
+
+    json_array = tmp_path / "products.json"
+    json_array.write_text('["010121", {"cmdCode": "020110"}]')
+    assert parse_import_file(json_array) == ["010121", "020110"]
+
+    json_obj = tmp_path / "wrapped.json"
+    json_obj.write_text('{"product_codes": [{"product_code": "010129"}]}')
+    assert parse_import_file(json_obj) == ["010129"]
+
+
+def test_parse_import_file_rejects_bad_files(tmp_path):
+    unsupported = tmp_path / "codes.yaml"
+    unsupported.write_text("DEU")
+    with pytest.raises(ConfigError, match="unsupported"):
+        parse_import_file(unsupported)
+
+    malformed = tmp_path / "codes.json"
+    malformed.write_text("{")
+    with pytest.raises(ConfigError, match="invalid JSON"):
+        parse_import_file(malformed)
+
+    empty = tmp_path / "codes.txt"
+    empty.write_text(" \n, ;")
+    with pytest.raises(ConfigError, match="no identifiers"):
+        parse_import_file(empty)
+
+
+def test_resolve_imported_reporters_partners_and_commodities(refs):
+    reps = PickerState(title="reporters", field_key="reporters", items=reporter_items(refs))
+    assert resolve_imported_selection(reps, refs, ["DEU", "8"]) == {"276", "8"}
+
+    parts = PickerState(title="partners", field_key="partners", items=partner_items(refs))
+    assert resolve_imported_selection(parts, refs, ["W00", "BRA"]) == {"0", "76"}
+
+    hs = PickerState(title="HS codes", field_key="commodities", items=commodity_items(refs, "HS"))
+    assert resolve_imported_selection(hs, refs, ["010121", "02"]) == {"010121", "02"}
+
+
+def test_resolve_imported_selection_rejects_unknowns_without_mutating(refs):
+    p = PickerState(
+        title="reporters",
+        field_key="reporters",
+        items=reporter_items(refs),
+        selected={"8"},
+    )
+    with pytest.raises(ConfigError, match="unknown reporters"):
+        resolve_imported_selection(p, refs, ["DEU", "ZZZ"])
+    assert p.selected == {"8"}
+
+
+def test_import_path_mode_and_import_replace_selection(tmp_path, refs):
+    p = PickerState(title="reporters", field_key="reporters", items=reporter_items(refs))
+    p.selected = {"8"}
+    s = _picker_state(tmp_path, refs, "reporters", p)
+    s.handle_key("I", _mk_disabled)
+    assert s.mode is Mode.IMPORT_PATH
+    assert s.handle_key("esc", _mk_disabled) is Action.NONE
+    assert s.mode is Mode.PICKER and p.selected == {"8"}
+
+    import_file = tmp_path / "reporters.txt"
+    import_file.write_text("DEU\nISL\n")
+    s.handle_key("I", _mk_disabled)
+    for ch in str(import_file):
+        s.handle_key("space" if ch == " " else ch, _mk_disabled)
+    assert s.handle_key("enter", _mk_disabled) is Action.IMPORT
+    s.import_picker_file(import_file, refs)
+    assert s.mode is Mode.PICKER
+    assert p.selected == {"276", "352"}
+    assert not p.all_selected
+
+
+def test_imported_commodities_force_codes_mode(tmp_path, refs):
+    p = PickerState(title="HS codes", field_key="commodities", items=commodity_items(refs, "HS"))
+    s = _state(tmp_path)
+    s.picker = p
+    s.mode = Mode.PICKER
+    import_file = tmp_path / "products.csv"
+    import_file.write_text("code\n010121\n020110\n")
+    s.import_picker_file(import_file, refs)
+    s.handle_key("enter", _mk_disabled)
+    assert s.values["commodities"] == {"mode": "codes", "codes": ["010121", "020110"]}
 
 
 # ---------------------------------------------------------------------------

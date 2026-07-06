@@ -124,10 +124,11 @@ uv run tradescrapr new    # same thing, explicit
 ```
 
 Pick reporters/partners/commodities from searchable lists (`space` toggles,
-`*` selects all), set periods and flows, and watch the live task/quota
-estimate. `s` saves the spec to `jobs/<name>.yaml`, plans the job, and then
-offers to start the worker or open the dashboard. The saved YAML is a normal
-job spec — everything below applies to it.
+`*` selects all). In reporter, partner, and commodity-code pickers, `I` imports
+the selection from a `.txt`, `.csv`, or `.json` list. Set periods and flows, and
+watch the live task/quota estimate. `s` saves the spec to `jobs/<name>.yaml`,
+plans the job, and then offers to start the worker or open the dashboard. The
+saved YAML is a normal job spec — everything below applies to it.
 
 ## Targeted mode
 
