@@ -78,6 +78,13 @@ The legacy name `COMTRADE_KEY` is also accepted. The key is only ever sent as a
 request header — it never appears in URLs, logs, manifests, or the state
 database, and `.env` is gitignored.
 
+### Public repo safety
+
+Do not commit real API keys, `.env`, downloaded data, SQLite state, or logs.
+The default `.gitignore` excludes `.env`, `data/`, `state/`, `logs/`, caches,
+and the virtual environment. `.env.example` intentionally contains only the
+placeholder `COMTRADE_API_KEY=your-key-here`.
+
 ### Free vs. premium
 
 | | Free | Premium Individual | Premium Institutional |
@@ -130,6 +137,24 @@ watch the live task/quota estimate. `s` saves the spec to `jobs/<name>.yaml`,
 plans the job, and then offers to start the worker or open the dashboard. The
 saved YAML is a normal job spec — everything below applies to it.
 
+### Import file formats
+
+Picker imports replace the current selection. They validate every identifier
+before applying anything, so a file with one unknown country or product code
+leaves the picker unchanged.
+
+Supported formats:
+
+- `.txt`: identifiers separated by newlines, commas, semicolons, or whitespace.
+- `.csv`: the first non-empty column from each row; a header such as `code`,
+  `country_code`, `iso3`, `product_code`, or `hs_code` is ignored.
+- `.json`: an array of identifiers, an array of objects with keys such as
+  `code`, `id`, `iso3`, `cmdCode`, or `product_code`, or an object containing a
+  list under `codes`, `reporters`, `partners`, `commodities`, or `products`.
+
+Reporters and partners may be ISO3 or numeric Comtrade codes. Commodity imports
+must match codes in the selected classification, and leading zeroes are kept.
+
 ## Targeted mode
 
 Job specs live in `jobs/*.yaml`:
@@ -161,6 +186,22 @@ only reporter-periods that actually exist are enqueued. One task = one
 reporter × period × flow at the requested commodity detail; oversized responses
 split automatically. `run` accepts `--job`, `--max-calls`, `--stop-after HOURS`,
 and `--no-wait-quota` (exit instead of sleeping at quota exhaustion).
+
+## Command reference
+
+| Command | Purpose |
+|---|---|
+| `tradescrapr` / `tradescrapr new` | Open the interactive job builder |
+| `tradescrapr refs refresh` | Refresh cached reporter, partner, and HS reference data |
+| `tradescrapr plan jobs/<spec>.yaml` | Expand a job spec into persistent tasks |
+| `tradescrapr plan jobs/<spec>.yaml --dry-run` | Preview task expansion without writing state |
+| `tradescrapr run` | Work queued tasks, resuming any interrupted job |
+| `tradescrapr status --verbose` | Show job/task progress and dead-task details |
+| `tradescrapr retry-dead` | Requeue dead tasks after fixing the underlying issue |
+| `tradescrapr monitor --dry-run` | Preview new/revised monthly releases |
+| `tradescrapr monitor` | Enqueue and scrape new/revised monthly releases |
+| `tradescrapr ui` | Open the live read-only dashboard |
+| `tradescrapr da --period 202405 --reporter DEU` | Inspect Comtrade availability rows |
 
 ### Long unattended runs
 
