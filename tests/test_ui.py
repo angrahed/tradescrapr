@@ -1,8 +1,10 @@
 import fcntl
 import io
+import os
 
 from rich.console import Console
 
+import tradescrapr.ui as ui
 from tradescrapr.planner import TaskParams
 from tradescrapr.ui import (
     auto_height,
@@ -11,6 +13,7 @@ from tradescrapr.ui import (
     human_bytes,
     human_count,
     probe_worker,
+    proc_state,
     render,
     sparkline,
     tail_log,
@@ -53,6 +56,44 @@ def test_probe_worker(tmp_path):
         held.flush()
         assert probe_worker(lock) == 4242
     assert probe_worker(lock) is None  # released
+
+
+def test_proc_state_this_process_is_running():
+    st = proc_state(os.getpid())
+    assert st and st not in ("T", "t")  # the test runner is running, not stopped
+
+
+def test_gather_flags_stalled_worker(cfg, store, monkeypatch):
+    _seed(cfg, store)
+    lock = cfg.paths.state_dir / "worker.lock"
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        held.write("4242\n")
+        held.flush()
+        # lock is held (probe sees pid 4242); a stopped process reads as stalled
+        monkeypatch.setattr(ui, "proc_state", lambda pid: "T")
+        stalled = gather(cfg, store, (0, 0))
+        assert stalled.worker_pid == 4242 and stalled.worker_stalled is True
+        # a live worker holding the lock is not stalled
+        monkeypatch.setattr(ui, "proc_state", lambda pid: "S")
+        running = gather(cfg, store, (0, 0))
+        assert running.worker_pid == 4242 and running.worker_stalled is False
+
+
+def test_stalled_worker_renders_in_header(cfg, store, monkeypatch):
+    _seed(cfg, store)
+    lock = cfg.paths.state_dir / "worker.lock"
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        held.write("4242\n")
+        held.flush()
+        monkeypatch.setattr(ui, "proc_state", lambda pid: "T")
+        snap = gather(cfg, store, (0, 0))
+    buf = io.StringIO()
+    Console(file=buf, width=110, height=40, force_terminal=True).print(
+        render(snap, height=auto_height(snap))
+    )
+    assert "stalled" in buf.getvalue()
 
 
 def _seed(cfg, store):

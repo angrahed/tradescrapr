@@ -56,7 +56,7 @@ def execute_bulk_task(worker: Worker, task: Task, params: TaskParams) -> None:
     part_dir = storage.partition_dir(
         cfg.paths.data, params.dataset, params.freq, params.period, params.reporter
     )
-    if worker.store.try_record_partition_cleanup(
+    if worker.replaces_whole_partition(task.job_id) and worker.store.try_record_partition_cleanup(
         task.job_id, params.dataset, params.freq, params.period, params.reporter
     ):
         storage.clean_partition(part_dir)

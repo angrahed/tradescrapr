@@ -96,6 +96,7 @@ class Worker:
         self.tasks_failed = 0
         # (dataset, type, freq, cl, reporter, period) -> totalRecords from getDA
         self._avail_cache: dict[tuple[str, ...], int | None] = {}
+        self._job_kind_cache: dict[str, str] = {}
 
     # -- signals & sleeps ---------------------------------------------------
 
@@ -138,6 +139,12 @@ class Worker:
         )
         self._sleep(secs)
 
+    def replaces_whole_partition(self, job_id: str) -> bool:
+        if job_id not in self._job_kind_cache:
+            row = self.store.get_job(job_id)
+            self._job_kind_cache[job_id] = str(row["kind"]) if row is not None else ""
+        return self._job_kind_cache[job_id] == "monitor"
+
     # -- task execution -------------------------------------------------------
 
     def _execute(self, task: Task) -> None:
@@ -151,9 +158,9 @@ class Worker:
         part_dir = storage.partition_dir(
             self.cfg.paths.data, params.dataset, params.freq, params.period, params.reporter
         )
-        # First task of this job touching this partition wipes it: re-scrapes and
-        # revision jobs fully replace old data, exactly once, regardless of order.
-        if self.store.try_record_partition_cleanup(
+        # Monitor revision jobs fully replace a published partition exactly once.
+        # Targeted jobs coexist, so separate product baskets do not wipe each other.
+        if self.replaces_whole_partition(task.job_id) and self.store.try_record_partition_cleanup(
             task.job_id, params.dataset, params.freq, params.period, params.reporter
         ):
             storage.clean_partition(part_dir)

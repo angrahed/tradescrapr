@@ -172,16 +172,31 @@ def test_max_calls_stops_early(cfg, store, refs):
     assert prog.counts == {"done": 1, "pending": 1}
 
 
-def test_revision_cleanup_wipes_partition_once_per_job(cfg, store, refs):
+def test_targeted_jobs_do_not_wipe_existing_partition(cfg, store, refs):
     # job 1 writes the partition
     _seed(store, [_params(flow="M")])
     _worker(cfg, store, refs, [_result(3)]).run()
     part = cfg.paths.data / "final" / "freq=A" / "period=2022" / "reporter=8"
     old_files = set(p.name for p in part.glob("part-*.parquet"))
-    # job 2 (re-scrape) wipes it before writing its own chunk
+    # a second targeted scrape in the same reporter-period should coexist
     store.create_job("j2", "targeted", "{}")
     store.add_tasks("j2", [_params(flow="M"), _params(flow="X")])
     _worker(cfg, store, refs, [_result(2), _result(2)]).run(job_id="j2")
     new_files = set(p.name for p in part.glob("part-*.parquet"))
-    assert not (old_files & new_files)  # old chunk gone
-    assert len(new_files) == 2  # both new tasks wrote; second didn't re-wipe the first
+    assert old_files < new_files
+    assert len(new_files) == 3
+
+
+def test_monitor_cleanup_wipes_partition_once_per_job(cfg, store, refs):
+    # job 1 writes the partition
+    _seed(store, [_params(flow="M")])
+    _worker(cfg, store, refs, [_result(3)]).run()
+    part = cfg.paths.data / "final" / "freq=A" / "period=2022" / "reporter=8"
+    old_files = set(p.name for p in part.glob("part-*.parquet"))
+    # monitor jobs are release replacements and wipe old chunks once per partition
+    store.create_job("j2", "monitor", "{}")
+    store.add_tasks("j2", [_params(flow="M"), _params(flow="X")])
+    _worker(cfg, store, refs, [_result(2), _result(2)]).run(job_id="j2")
+    new_files = set(p.name for p in part.glob("part-*.parquet"))
+    assert not (old_files & new_files)
+    assert len(new_files) == 2

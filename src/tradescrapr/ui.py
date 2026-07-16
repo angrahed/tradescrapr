@@ -15,6 +15,7 @@ import fcntl
 import os
 import re
 import select
+import subprocess
 import sys
 import termios
 import time
@@ -55,6 +56,7 @@ class Snapshot:
     now: dt.datetime
     tier: str
     worker_pid: int | None  # None = no worker holds the lock
+    worker_stalled: bool  # lock held, but the process is stopped (Ctrl+Z), not working
     quota_used: int
     quota_budget: int | None
     quota_reset_s: float
@@ -85,6 +87,32 @@ def probe_worker(lock_path: Path) -> int | None:
             return None
     except OSError:
         return None
+
+
+_STOPPED_STATES = ("T", "t")  # stopped by job control (Ctrl+Z) or ptrace
+
+
+def proc_state(pid: int) -> str:
+    """Single-letter process state ('R','S','T',…), or '' if it can't be read.
+    A worker suspended with Ctrl+Z sits in 'T' (stopped) yet still holds
+    worker.lock, so the lock probe alone would report it as running."""
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():  # Linux
+        try:
+            data = stat.read_text()
+            return data[data.rindex(")") + 2]  # state char follows the "(comm) " field
+        except (OSError, ValueError, IndexError):
+            return ""
+    try:  # macOS/BSD have no /proc — ask ps
+        out = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return out.stdout.strip()[:1]
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 _INTERESTING = (
@@ -120,10 +148,12 @@ def data_stats(data_root: Path) -> tuple[int, int]:
 
 def gather(cfg: Config, store: Store, stats: tuple[int, int]) -> Snapshot:
     quota = QuotaLedger(store, cfg.quota)
+    pid = probe_worker(cfg.paths.state_dir / "worker.lock")
     return Snapshot(
         now=dt.datetime.now(),
         tier=cfg.tier,
-        worker_pid=probe_worker(cfg.paths.state_dir / "worker.lock"),
+        worker_pid=pid,
+        worker_stalled=bool(pid and pid > 0 and proc_state(pid) in _STOPPED_STATES),
         quota_used=quota.used_today(),
         quota_budget=cfg.quota.daily_budget,
         quota_reset_s=quota.seconds_until_reset(),
@@ -174,13 +204,19 @@ def _fmt_reset(seconds: float) -> str:
 
 
 def _header(snap: Snapshot) -> Panel:
+    if snap.worker_stalled:
+        worker_badge = ("⏸ stalled", f"bold {WARN}")  # holds the lock but stopped
+    elif snap.worker_pid:
+        worker_badge = ("● running", f"bold {OK}")
+    else:
+        worker_badge = ("○ idle", DIM)
     title = Text.assemble(
         ("tradescrapr ", f"bold {ACCENT}"),
         (f"v{__version__}", DIM),
         ("   tier ", DIM),
         (snap.tier, "bold magenta" if snap.tier == "premium" else "bold"),
         ("   worker ", DIM),
-        (("● running", f"bold {OK}") if snap.worker_pid else ("○ idle", DIM)),
+        worker_badge,
         ((f" pid {snap.worker_pid}", DIM) if snap.worker_pid and snap.worker_pid > 0 else ("", "")),
         ("   ", ""),
         (snap.now.strftime("%Y-%m-%d %H:%M:%S"), DIM),
