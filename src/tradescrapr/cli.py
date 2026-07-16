@@ -85,6 +85,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--job", default=None, help="restrict to one job id")
     sp.add_argument("--task", default=None, help="a single task id")
 
+    sp = sub.add_parser(
+        "cancel", help="stop a job running: mark its unfinished tasks cancelled (keeps data)"
+    )
+    sp.add_argument("job", help="job id to cancel")
+
+    sp = sub.add_parser(
+        "delete", aliases=["rm"], help="remove a job and all its tasks from the queue"
+    )
+    sp.add_argument("job", help="job id to delete")
+    sp.add_argument(
+        "--data", action="store_true", help="also delete the parquet files this job wrote"
+    )
+    sp.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+
     sp = sub.add_parser("refs", help="reference data management")
     refsub = sp.add_subparsers(dest="refs_command", required=True)
     refsub.add_parser("refresh", help="force re-download of reference files")
@@ -172,6 +186,14 @@ def main(argv: list[str] | None = None) -> int:
             from .status import cmd_retry_dead
 
             return cmd_retry_dead(cfg, job_id=args.job, task_id=args.task)
+        if args.command == "cancel":
+            from .status import cmd_cancel_job
+
+            return cmd_cancel_job(cfg, job_id=args.job)
+        if args.command in ("delete", "rm"):
+            from .status import cmd_delete_job
+
+            return cmd_delete_job(cfg, job_id=args.job, remove_data=args.data, assume_yes=args.yes)
         if args.command == "refs":
             from .refs import cmd_refs_refresh
 

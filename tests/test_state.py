@@ -156,3 +156,37 @@ def test_partition_cleanup_fires_once(store):
     assert store.try_record_partition_cleanup("j1", "final", "A", "2022", "8")
     assert not store.try_record_partition_cleanup("j1", "final", "A", "2022", "8")
     assert store.try_record_partition_cleanup("j2", "final", "A", "2022", "8")  # new job
+
+
+def test_cancel_job_stops_claiming_but_keeps_history(store):
+    ids = _seed(store, params=[_params(flow="M"), _params(flow="X")])
+    done = store.claim_next_task()
+    store.finish_task(done.task_id, records=3, paths=["a.parquet"])
+
+    assert store.cancel_job("j1") == 1  # only the one still-pending task
+    assert store.claim_next_task() is None  # cancelled tasks are not claimable
+    assert store.get_job("j1")["status"] == "cancelled"
+
+    prog = store.job_progress("j1")[0]
+    assert prog.counts["cancelled"] == 1
+    assert prog.counts["done"] == 1  # finished work is preserved
+    assert prog.records == 3
+    assert set(ids) == {done.task_id} | {
+        r["task_id"] for r in store.db.execute("SELECT task_id FROM tasks WHERE status='cancelled'")
+    }
+
+
+def test_delete_job_removes_rows_and_leaves_siblings(store):
+    parent_ids = _seed(store, job="keep", params=[_params(reporter="8")])
+    _seed(store, job="drop", params=[_params(reporter="276"), _params(reporter="352")])
+    # a split gives 'drop' a self-referential parent link to exercise the FK path
+    parent = store.claim_next_task(job_id="drop")
+    store.split_task(parent, [_params(reporter="276", partners=("4",))])
+
+    n = store.delete_job("drop")
+    assert n == 3  # two originals + one split child
+    assert store.get_job("drop") is None
+    assert store.db.execute("SELECT COUNT(*) FROM tasks WHERE job_id='drop'").fetchone()[0] == 0
+    # the untouched sibling job and its task survive
+    assert store.get_job("keep") is not None
+    assert store.claim_next_task(job_id="keep").task_id == parent_ids[0]

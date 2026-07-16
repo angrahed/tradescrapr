@@ -208,6 +208,43 @@ class Store:
     def get_job(self, job_id: str) -> sqlite3.Row | None:
         return self.db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
 
+    def cancel_job(self, job_id: str) -> int:
+        """Stop a job from running: mark its unsettled tasks cancelled and flag the
+        job cancelled. Settled work (done/split/dead) and data files are untouched.
+        A task already in flight is set cancelled too, but if the worker finishes it
+        first that task flips back to done — harmless, its data is kept either way."""
+        with self.db:
+            cur = self.db.execute(
+                """UPDATE tasks SET status='cancelled', last_error='job cancelled',
+                   finished_at=:now
+                   WHERE job_id=:job_id AND status IN ('pending','failed','in_progress')""",
+                {"job_id": job_id, "now": _now()},
+            )
+            self.db.execute("UPDATE jobs SET status='cancelled' WHERE job_id=?", (job_id,))
+        return cur.rowcount
+
+    def delete_job(self, job_id: str) -> int:
+        """Remove a job and all its tasks; returns the task rows deleted. Parent
+        links are nulled first so the self-referential FK can't block the bulk
+        delete, and the job row goes last to satisfy the tasks -> jobs FK. Orphan
+        rows in releases/partition_cleanups (monitor jobs only) go too."""
+        with self.db:
+            self.db.execute("UPDATE tasks SET parent_task_id=NULL WHERE job_id=?", (job_id,))
+            self.db.execute("DELETE FROM partition_cleanups WHERE job_id=?", (job_id,))
+            self.db.execute("DELETE FROM releases WHERE job_id=?", (job_id,))
+            n = self.db.execute("DELETE FROM tasks WHERE job_id=?", (job_id,)).rowcount
+            self.db.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
+        return n
+
+    def job_task_outputs(self, job_id: str) -> list[sqlite3.Row]:
+        """(dataset, freq, period, reporter, task_id) for tasks that wrote files —
+        enough to locate this job's parquet without touching other jobs' data."""
+        return self.db.execute(
+            """SELECT dataset, freq, period, reporter, task_id FROM tasks
+               WHERE job_id=? AND output_paths IS NOT NULL AND output_paths!=''""",
+            (job_id,),
+        ).fetchall()
+
     # -- tasks ----------------------------------------------------------------
 
     def _insert_task_rows(

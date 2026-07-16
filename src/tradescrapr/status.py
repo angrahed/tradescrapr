@@ -1,9 +1,11 @@
-"""Status reporting and dead-task management."""
+"""Status reporting and job/dead-task management."""
 
 from __future__ import annotations
 
 import logging
+import sys
 
+from . import storage
 from .config import Config
 from .quota import QuotaLedger
 from .state import Store
@@ -68,4 +70,65 @@ def cmd_retry_dead(cfg: Config, *, job_id: str | None = None, task_id: str | Non
     finally:
         store.close()
     print(f"revived {n} dead task(s)")
+    return 0
+
+
+def cmd_cancel_job(cfg: Config, *, job_id: str) -> int:
+    """Stop a job running without deleting it: its unfinished tasks become
+    cancelled so the worker skips them; history and data stay in place."""
+    store = Store(cfg.paths.state_db)
+    try:
+        if store.get_job(job_id) is None:
+            print(f"no such job: {job_id}", file=sys.stderr)
+            return 1
+        n = store.cancel_job(job_id)
+    finally:
+        store.close()
+    print(f"cancelled {job_id}: {n} unfinished task(s) marked cancelled (data kept)")
+    print("note: a task already in flight in a running worker may still finish")
+    return 0
+
+
+def cmd_delete_job(
+    cfg: Config, *, job_id: str, remove_data: bool = False, assume_yes: bool = False
+) -> int:
+    """Remove a job and its tasks from the queue. With --data, also delete the
+    parquet chunks this job wrote (located per task, so sibling jobs sharing a
+    partition are left intact)."""
+    store = Store(cfg.paths.state_db)
+    try:
+        if store.get_job(job_id) is None:
+            print(f"no such job: {job_id}", file=sys.stderr)
+            return 1
+        progress = store.job_progress(job_id)
+        total = progress[0].total if progress else 0
+        outputs = store.job_task_outputs(job_id)
+
+        if not assume_yes:
+            if not sys.stdin.isatty():
+                print("refusing to delete without confirmation; pass --yes", file=sys.stderr)
+                return 2
+            extra = f" and delete {len(outputs)} task(s)' data files" if remove_data else ""
+            reply = input(f"delete job {job_id} ({total} task(s)){extra}? [y/N] ").strip().lower()
+            if reply not in ("y", "yes"):
+                print("aborted")
+                return 1
+
+        removed_files = 0
+        if remove_data:
+            for r in outputs:
+                part = storage.partition_dir(
+                    cfg.paths.data, r["dataset"], r["freq"], r["period"], r["reporter"]
+                )
+                removed_files += storage.remove_task_outputs(part, r["task_id"])
+
+        n = store.delete_job(job_id)
+    finally:
+        store.close()
+    tail = (
+        f", {removed_files} data file(s) deleted"
+        if remove_data
+        else " (data files kept; re-run with --data to remove them)"
+    )
+    print(f"deleted {job_id}: {n} task(s) removed{tail}")
     return 0
