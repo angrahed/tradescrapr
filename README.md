@@ -13,8 +13,8 @@ unattended operation, with two modes:
    exactly that, at full detail.
 
 Plus a full-screen interactive job builder (just run `tradescrapr`) to pick
-exactly what to download, and a live terminal dashboard (`tradescrapr ui`) to
-watch it work.
+exactly what to download, and a live terminal dashboard (`tradescrapr ui`) that
+shows every download as it happens and starts, stops, and retries the work.
 
 **Key properties**
 
@@ -133,9 +133,10 @@ uv run tradescrapr new    # same thing, explicit
 Pick reporters/partners/commodities from searchable lists (`space` toggles,
 `*` selects all). In reporter, partner, and commodity-code pickers, `I` imports
 the selection from a `.txt`, `.csv`, or `.json` list. Set periods and flows, and
-watch the live task/quota estimate. `s` saves the spec to `jobs/<name>.yaml`,
-plans the job, and then offers to start the worker or open the dashboard. The
-saved YAML is a normal job spec — everything below applies to it.
+watch the live task/quota estimate. `s` saves the spec to `jobs/<name>.yaml`
+and plans the job; then `w` starts downloading in a background worker and
+opens the dashboard on it. The saved YAML is a normal job spec — everything
+below applies to it.
 
 ### Import file formats
 
@@ -176,7 +177,8 @@ breakdown: classic        # classic = totals over partner2/customs/transport-mod
 
 ```bash
 uv run tradescrapr plan jobs/eu3_hs6_annual.yaml    # create job + tasks (idempotent)
-uv run tradescrapr run                              # work the queue; running IS resuming
+uv run tradescrapr start                            # download in the background + watch
+uv run tradescrapr run                              # ...or in the foreground; running IS resuming
 uv run tradescrapr status --verbose                 # progress, quota burn, dead tasks
 uv run tradescrapr retry-dead                       # revive dead tasks after fixing causes
 ```
@@ -185,7 +187,13 @@ Planning is idempotent (the job id hashes the spec), and with `reporters: all`
 only reporter-periods that actually exist are enqueued. One task = one
 reporter × period × flow at the requested commodity detail; oversized responses
 split automatically. `run` accepts `--job`, `--max-calls`, `--stop-after HOURS`,
-and `--no-wait-quota` (exit instead of sleeping at quota exhaustion).
+`--no-wait-quota` (exit instead of sleeping at quota exhaustion), and `--plain`.
+
+In a terminal, a foreground `run` keeps the log scrolling and pins a live
+progress display under it: the call in flight (waiting on the server,
+receiving with bytes and rate, parsing, writing), backoff and quota-sleep
+countdowns, and the queue with its ETA. `--plain` (or any non-terminal output,
+like `nohup` or cron) gives plain log lines as before.
 
 ## Command reference
 
@@ -195,15 +203,22 @@ and `--no-wait-quota` (exit instead of sleeping at quota exhaustion).
 | `tradescrapr refs refresh` | Refresh cached reporter, partner, and HS reference data |
 | `tradescrapr plan jobs/<spec>.yaml` | Expand a job spec into persistent tasks |
 | `tradescrapr plan jobs/<spec>.yaml --dry-run` | Preview task expansion without writing state |
-| `tradescrapr run` | Work queued tasks, resuming any interrupted job |
+| `tradescrapr run` | Work queued tasks in the foreground, resuming any interrupted job |
+| `tradescrapr start` | Start a background worker (outlives the terminal) and open the dashboard |
+| `tradescrapr stop` | Stop the worker after its current task (`--now`: immediately) |
 | `tradescrapr status --verbose` | Show job/task progress and dead-task details |
 | `tradescrapr retry-dead` | Requeue dead tasks after fixing the underlying issue |
 | `tradescrapr monitor --dry-run` | Preview new/revised monthly releases |
 | `tradescrapr monitor` | Enqueue and scrape new/revised monthly releases |
-| `tradescrapr ui` | Open the live read-only dashboard |
+| `tradescrapr ui` | Open the live dashboard (watch, start, stop, retry) |
 | `tradescrapr da --period 202405 --reporter DEU` | Inspect Comtrade availability rows |
 
 ### Long unattended runs
+
+The simplest way is `tradescrapr start` (or `s` in the dashboard): the worker
+runs in its own session, so closing the terminal or the dashboard does not
+stop it, and on macOS it is paired with `caffeinate` so idle sleep does not
+pause it. `tradescrapr stop` ends it. The classic route works as well:
 
 ```bash
 nohup uv run tradescrapr run >> logs/nohup.log 2>&1 &
@@ -258,16 +273,40 @@ Schedule it daily (releases trickle in all month). Linux crontab:
 ## Dashboard
 
 ```bash
-uv run tradescrapr ui            # live full-screen dashboard (q quits, r refreshes)
-uv run tradescrapr ui --once     # one static snapshot (pipe-friendly)
+uv run tradescrapr ui                 # live full-screen dashboard
+uv run tradescrapr ui --theme amber   # classic | phosphor | amber (t cycles; remembered)
+uv run tradescrapr ui --once          # one static snapshot (pipe-friendly)
 ```
 
-An htop-style view: quota gauge with a 7-day burn sparkline and time-to-reset,
-per-job progress bars with ETA, what the worker is fetching right now, the
-monitor's release backlog by period, a live color-coded activity feed, and dead
-tasks front and center. It is a **read-only observer** — run it in a second
-tmux pane or SSH session while a worker is going; the header shows whether a
-worker currently holds the lock.
+An htop-style control room for the scraper:
+
+- **Now** — what the worker is doing this second: the reporter, period, and
+  flows in flight; the phase (waiting on the server → receiving → parsing →
+  writing); bytes received against the response size with the transfer
+  rate; how long the server took to answer; and an estimate from how long the
+  same reporter (or job) took before. Backoffs and quota sleeps show as
+  countdowns, transport-level retries (a run of 503s) as notes.
+- **Jobs** — per-job progress bars (done, running, retrying, dead), rows,
+  disk size, and work left; the title carries the overall ETA, computed
+  from per-reporter durations and capped by the daily quota on the free tier.
+- **Throughput** — rows per minute over 15m / 1h / 6h / 24h (`[` `]`), tasks
+  per hour, and the quota gauge with a 7-day history.
+- **Activity**, **attention** (dead and retrying tasks with their errors,
+  monitor backlog), and **up next** (the queue head with rough start times).
+- `⏎` opens a job: its spec, a reporter × period coverage map, and every
+  failed task. `l` opens the full, filterable activity log. `?` lists keys.
+
+It also drives the worker: `s` starts a background worker on everything
+queued (`S`: the selected job only), `x` stops it after the current task
+(`x` again: stop now, returning the task to the queue), `c` resumes a worker
+suspended with Ctrl+Z, `R` retries dead tasks, and `C` cancels a job; both
+of the last two ask first. Quitting the dashboard leaves a worker running.
+
+The worker publishes its live state to `state/worker.json` (atomic, a few
+writes a second at most), so the dashboard works the same next to a worker
+started any other way — `run` in tmux, systemd, cron. It reads the database
+on a background thread and repaints only the cells that change, so it stays
+light over SSH.
 
 ## Data layout & provenance
 
@@ -335,9 +374,10 @@ Two platform notes:
   Load with `launchctl load ~/Library/LaunchAgents/org.tradescrapr.monitor.plist`.
   (A `.env` file at the project root works too, since `WorkingDirectory` is set.)
 
-- **Laptop sleep**: wrap long foreground runs in `caffeinate -i uv run
-  tradescrapr run` so idle sleep doesn't pause the worker. Interrupted runs
-  resume anyway; this just avoids the pause.
+- **Laptop sleep**: `tradescrapr start` (and `s` in the dashboard) keeps the
+  Mac awake while the worker runs. For foreground runs, wrap them in
+  `caffeinate -i uv run tradescrapr run`. Interrupted runs resume anyway;
+  this just avoids the pause.
 
 ## Recovery cheatsheet
 

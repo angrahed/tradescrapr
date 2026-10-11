@@ -1,4 +1,4 @@
-"""Command-line entry point: plan / run / status / monitor / retry-dead / refs / da."""
+"""Command-line entry point: plan / run / start / stop / status / monitor / ui / refs / da."""
 
 from __future__ import annotations
 
@@ -43,6 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--version", action="version", version=f"tradescrapr {__version__}")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging on console")
+    p.add_argument(
+        "-q", "--quiet", action="store_true", help="no console logging (the log file still gets it)"
+    )
     p.add_argument("--root", type=Path, default=None, help="project root (default: auto-detect)")
     p.add_argument("--tier", choices=["free", "premium"], default=None, help="override tier")
     sub = p.add_subparsers(dest="command", required=False)
@@ -66,6 +69,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit instead of sleeping when the daily quota is exhausted",
     )
+    sp.add_argument("--plain", action="store_true", help="log lines only, no live progress display")
+
+    sp = sub.add_parser(
+        "start", help="start a background worker (survives closing the terminal), then watch it"
+    )
+    sp.add_argument("--job", default=None, help="restrict to one job id")
+    sp.add_argument("--no-ui", action="store_true", help="just start it; don't open the dashboard")
+
+    sp = sub.add_parser("stop", help="stop the running worker after its current task")
+    sp.add_argument(
+        "--now", action="store_true", help="stop immediately; the in-flight task is re-queued"
+    )
 
     sp = sub.add_parser("status", help="job progress, quota usage, ETA")
     sp.add_argument("--job", default=None, help="restrict to one job id")
@@ -80,6 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="sleep through quota exhaustion instead of exiting",
     )
+    sp.add_argument("--plain", action="store_true", help="log lines only, no live progress display")
 
     sp = sub.add_parser("retry-dead", help="revive dead tasks (reset attempts)")
     sp.add_argument("--job", default=None, help="restrict to one job id")
@@ -104,16 +120,22 @@ def build_parser() -> argparse.ArgumentParser:
     refsub.add_parser("refresh", help="force re-download of reference files")
 
     sp = sub.add_parser(
-        "ui", aliases=["dashboard"], help="live terminal dashboard (runs beside a worker)"
+        "ui", aliases=["dashboard"], help="live dashboard: watch, start, and stop the worker"
     )
     sp.add_argument(
         "--refresh",
         type=float,
-        default=2.0,
+        default=1.0,
         metavar="SECONDS",
-        help="repaint interval (default 2s)",
+        help="how often to re-read the state database (default 1s; the screen animates anyway)",
     )
     sp.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    sp.add_argument(
+        "--theme",
+        choices=["classic", "phosphor", "amber"],
+        default=None,
+        help="colour theme (default: the last one picked with t)",
+    )
 
     sp = sub.add_parser("da", help="debug: print data availability (free endpoint)")
     sp.add_argument("--type", dest="type_code", default="C", choices=["C", "S"])
@@ -132,6 +154,33 @@ def _load(args: argparse.Namespace) -> Config:
     return cfg
 
 
+def cmd_start(cfg: Config, *, job_id: str | None = None, open_ui: bool = True) -> int:
+    from .ui import cmd_ui
+    from .ui.control import start_worker
+
+    sp = start_worker(cfg, job_id=job_id)
+    awake = " (caffeinate keeps the Mac awake while it runs)" if sp.keep_awake else ""
+    print(f"worker started in the background, pid {sp.pid}{awake}")
+    if open_ui and sys.stdin.isatty() and sys.stdout.isatty():
+        return cmd_ui(cfg, spawned=sp)
+    print("watch it:  tradescrapr ui        stop it:  tradescrapr stop")
+    return 0
+
+
+def cmd_stop(cfg: Config, *, now: bool = False) -> int:
+    from .ui.control import stop_worker
+
+    pid = stop_worker(cfg, now=now)
+    if pid is None:
+        print("no worker is running")
+        return 1
+    if now:
+        print(f"stopping worker {pid} now; its in-flight task goes back to the queue")
+    else:
+        print(f"asked worker {pid} to stop after its current task (`stop --now` to cut it short)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -148,10 +197,18 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    live = (
+        args.command in ("run", "monitor")
+        and not getattr(args, "plain", False)
+        and not args.quiet
+        and not getattr(args, "dry_run", False)
+        and sys.stdout.isatty()
+        and sys.stderr.isatty()
+    )
     setup_logging(
         cfg.paths.logs,
         args.verbose,
-        console_output=args.command not in ("ui", "dashboard", "new"),
+        console_output=not args.quiet and args.command not in ("ui", "dashboard", "new"),
     )
     log.debug("root=%s tier=%s", cfg.paths.root, cfg.tier)
 
@@ -173,7 +230,12 @@ def main(argv: list[str] | None = None) -> int:
                 max_calls=args.max_calls,
                 stop_after_hours=args.stop_after,
                 wait_quota=not args.no_wait_quota,
+                live=live,
             )
+        if args.command == "start":
+            return cmd_start(cfg, job_id=args.job, open_ui=not args.no_ui)
+        if args.command == "stop":
+            return cmd_stop(cfg, now=args.now)
         if args.command == "status":
             from .status import cmd_status
 
@@ -181,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "monitor":
             from .jobs.monitor import cmd_monitor
 
-            return cmd_monitor(cfg, dry_run=args.dry_run, wait_quota=args.wait_quota)
+            return cmd_monitor(cfg, dry_run=args.dry_run, wait_quota=args.wait_quota, live=live)
         if args.command == "retry-dead":
             from .status import cmd_retry_dead
 
@@ -201,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in ("ui", "dashboard"):
             from .ui import cmd_ui
 
-            return cmd_ui(cfg, refresh=args.refresh, once=args.once)
+            return cmd_ui(cfg, refresh=args.refresh, once=args.once, theme=args.theme)
         if args.command == "da":
             from .availability import cmd_da
 
@@ -219,6 +281,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except TradescraprError as e:
         log.error("%s", e)
+        if args.quiet:  # no console log: still say why (a background start captures this)
+            print(f"error: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         log.warning("interrupted")

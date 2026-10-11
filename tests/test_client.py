@@ -145,3 +145,75 @@ def test_download_file_writes_and_hashes(client, tmp_path):
 
     assert sha == hashlib.sha256(b"hello-bulk-bytes").hexdigest()
     assert not list(tmp_path.glob("*.part"))
+
+
+@responses.activate
+def test_get_data_streams_with_progress(client):
+    responses.get(DATA_URL, json=_payload(50))
+    seen = []
+    res = client.get_data(
+        dataset="final",
+        type_code="C",
+        freq="A",
+        cl_code="HS",
+        query={},
+        on_progress=lambda stage, wire, total: seen.append((stage, wire, total)),
+    )
+    stages = [s for s, _, _ in seen]
+    assert stages[0] == "headers" and stages[-1] == "done" and "body" in stages
+    assert seen[-1][1] == res.wire_bytes > 0
+    assert res.ttfb_s >= 0 and len(res.records) == 50
+
+
+@responses.activate
+def test_download_progress_counts_against_content_length(client, tmp_path):
+    body = b"x" * 5000
+    responses.get("https://x/f.gz", body=body, headers={"Content-Length": "5000"})
+    seen = []
+    client.download_file(
+        "https://x/f.gz",
+        tmp_path / "f.gz",
+        need_key=False,
+        chunk_size=1000,
+        on_progress=lambda stage, wire, total: seen.append((stage, wire, total)),
+    )
+    assert seen[0] == ("headers", 0, 5000)
+    assert seen[-1] == ("done", 5000, 5000)
+    assert [w for s, w, _ in seen if s == "body"] == [1000, 2000, 3000, 4000, 5000]
+
+
+def test_transport_retries_are_reported():
+    from urllib3.response import HTTPResponse
+
+    from tradescrapr.client import build_session
+
+    heard = []
+    session = build_session(3, 0.5, notify=heard.append)
+    retry = session.get_adapter("https://").max_retries
+    nxt = retry.increment(method="GET", url="/x", response=HTTPResponse(status=503))
+    nxt.increment(method="GET", url="/x", response=HTTPResponse(status=502))
+    assert heard[0].startswith("transport retry 1/3 after HTTP 503")
+    assert heard[1].startswith("transport retry 2/3 after HTTP 502")
+
+
+def test_wire_bytes_fall_back_for_chunked_bodies():
+    from types import SimpleNamespace
+
+    from tradescrapr.client import _wire_bytes
+
+    chunked = SimpleNamespace(raw=SimpleNamespace(tell=lambda: 0))
+    assert _wire_bytes(chunked, 4096) == 4096
+    plain = SimpleNamespace(raw=SimpleNamespace(tell=lambda: 1234))
+    assert _wire_bytes(plain, 4096) == 1234
+
+
+def test_retry_note_honours_retry_after():
+    from urllib3.response import HTTPResponse
+
+    from tradescrapr.client import build_session
+
+    heard = []
+    retry = build_session(3, 0.5, notify=heard.append).get_adapter("https://").max_retries
+    resp = HTTPResponse(status=503, headers={"Retry-After": "120"})
+    retry.increment(method="GET", url="/x", response=resp)
+    assert heard == ["transport retry 1/3 after HTTP 503, waiting 120s"]

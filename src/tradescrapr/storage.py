@@ -17,6 +17,7 @@ import hashlib
 import logging
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -91,8 +92,10 @@ def convert_bulk_file(
     task_id: str,
     manifest_meta: dict[str, Any],
     batch_rows: int = 2_000_000,
+    on_chunk: Callable[[int, int], None] | None = None,
 ) -> list[WriteResult]:
     """Convert a gzipped bulk TSV into parquet chunks of ~batch_rows each.
+    on_chunk(chunks_written, rows_written) runs after each chunk lands.
 
     Read as all-Utf8 (infer_schema_length=0) so every batch has an identical
     schema, then cast through the same dtype pins as API responses."""
@@ -114,6 +117,8 @@ def convert_bulk_file(
                     manifest_meta={**manifest_meta, "seq": seq},
                 )
             )
+            if on_chunk:
+                on_chunk(len(results), sum(r.rows for r in results))
     finally:
         tsv_path.unlink(missing_ok=True)
     return results

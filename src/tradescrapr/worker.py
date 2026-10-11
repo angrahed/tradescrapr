@@ -5,7 +5,8 @@ Robustness model:
 - Resume-by-default: on start, all in_progress tasks are reset to pending (safe —
   execution is idempotent, outputs are keyed by task_id and rewritten).
 - SIGTERM/SIGINT set a shutdown event checked between tasks and inside every sleep;
-  the in-flight request is bounded by the HTTP timeout. A second signal hard-exits.
+  the in-flight request is bounded by the HTTP timeout. A second signal hard-exits,
+  returning the in-flight task to the queue.
 - Quota exhaustion releases the current task without burning an attempt, then either
   sleeps until the reset (interruptibly) or exits 0 for cron to resume later.
 - Transient errors back off exponentially with jitter and re-queue; permanent errors
@@ -13,6 +14,8 @@ Robustness model:
 - Truncated responses split into children along flow -> partner groups (sized from
   the free availability endpoint's record counts) -> commodity batches, in the same
   transaction that retires the parent.
+- Every phase (request, receive, parse, write, backoff, quota sleep) is published
+  to state/worker.json through a StatusBoard, for dashboards and the inline display.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ import random
 import signal
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from . import storage
@@ -38,14 +41,13 @@ from .errors import (
     TradescraprError,
     TransientError,
 )
+from .livestatus import STATUS_FILE, StatusBoard
 from .planner import TaskParams, split
 from .quota import QuotaLedger
 from .refs import Refs
 from .state import Store, Task
 
 log = logging.getLogger(__name__)
-
-_SLEEP_SLICE_S = 30.0
 
 # Rough inflation of full-breakdown record counts (getDA totalRecords, all flows,
 # every partner2/customs/mot cell) over the classic subset one flow-call returns.
@@ -56,9 +58,12 @@ FULL_TO_CLASSIC_RATIO = 3.0
 @contextmanager
 def worker_lock(path: Path):
     """Exclusive singleton lock. Held for the whole run; the OS releases it on
-    any kind of process death, so no stale-lock handling is needed."""
+    any kind of process death, so no stale-lock handling is needed. The file
+    holds the owner's pid (for `stop` and the dashboard), so it is only
+    truncated once the lock is ours — a refused second worker must not erase
+    the running one's pid."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = open(path, "w")
+    fd = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o644), "r+")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -66,6 +71,7 @@ def worker_lock(path: Path):
         raise TradescraprError(
             f"another tradescrapr worker or monitor is already running ({path} is locked)"
         ) from None
+    fd.truncate(0)
     fd.write(f"{os.getpid()}\n")
     fd.flush()
     try:
@@ -83,12 +89,14 @@ class Worker:
         client: ComtradeClient,
         quota: QuotaLedger,
         refs: Refs,
+        board: StatusBoard | None = None,
     ):
         self.cfg = cfg
         self.store = store
         self.client = client
         self.quota = quota
         self.refs = refs
+        self.board = board or StatusBoard(None)
         self.shutdown = threading.Event()
         self.calls_made = 0
         self.tasks_done = 0
@@ -108,35 +116,30 @@ class Worker:
                 raise SystemExit(130)
             log.warning("%s received — finishing current task, then stopping", name)
             self.shutdown.set()
+            self.board.stopping()
 
         signal.signal(signal.SIGTERM, handler)
         signal.signal(signal.SIGINT, handler)
 
     def _sleep(self, seconds: float) -> None:
-        """Sleep in slices so shutdown stays responsive."""
-        end = time.monotonic() + seconds
-        while not self.shutdown.is_set():
-            remaining = end - time.monotonic()
-            if remaining <= 0:
-                return
-            time.sleep(min(_SLEEP_SLICE_S, remaining))
+        """Sleep, waking the moment shutdown is requested."""
+        self.shutdown.wait(max(seconds, 0.0))
 
-    def _backoff(self, attempts: int, retry_after: float | None) -> None:
+    def _backoff(self, attempts: int, retry_after: float | None, reason: str = "") -> None:
         r = self.cfg.retry
         delay = min(r.backoff_cap_s, r.backoff_base_s * 2 ** max(attempts - 1, 0))
         delay *= random.uniform(0.5, 1.5)
         if retry_after:
             delay = max(delay, retry_after)
         log.info("backing off %.0fs", delay)
+        self.board.waiting("backoff", delay, reason)
         self._sleep(delay)
 
     def _sleep_until_quota_reset(self) -> None:
         secs = self.quota.seconds_until_reset() + 60  # headroom past the boundary
-        log.info(
-            "quota exhausted (used=%d); sleeping %.0f min until reset",
-            self.quota.used_today(),
-            secs / 60,
-        )
+        used = self.quota.used_today()
+        log.info("quota exhausted (used=%d); sleeping %.0f min until reset", used, secs / 60)
+        self.board.waiting("quota", secs, f"{used} calls used today")
         self._sleep(secs)
 
     def replaces_whole_partition(self, job_id: str) -> bool:
@@ -169,6 +172,8 @@ class Worker:
         if not self.quota.try_reserve():
             raise QuotaExhausted(f"daily budget spent ({self.quota.used_today()} calls)")
         self.calls_made += 1
+        self.board.call()
+        self.board.phase("request")
         try:
             result = self.client.get_data(
                 dataset=params.dataset,
@@ -176,6 +181,8 @@ class Worker:
                 freq=params.freq,
                 cl_code=params.cl_code,
                 query=params.api_query(),
+                on_progress=self.board.transfer,
+                on_retry=self.board.note,
             )
         except QuotaExhausted:
             self.quota.force_exhaust()
@@ -187,6 +194,7 @@ class Worker:
 
         paths: list[str] = []
         rows = 0
+        self.board.phase("write", rows=len(result.records))
         if result.records:
             wr = storage.write_chunk(
                 result.records,
@@ -204,13 +212,16 @@ class Worker:
             rows = wr.rows
         self.store.finish_task(task.task_id, records=rows, paths=paths)
         self.tasks_done += 1
+        self.board.task_end("done", rows=rows, wire=result.wire_bytes)
         log.info(
-            "task=%s job=%s %s status=done records=%d dur=%.1fs",
+            "task=%s job=%s %s status=done records=%d dur=%.1fs ttfb=%.1fs bytes=%d",
             task.task_id,
             task.job_id,
             params.describe(),
             rows,
             result.elapsed_s,
+            result.ttfb_s,
+            result.wire_bytes,
         )
 
     def _estimate_rows(self, params: TaskParams) -> float | None:
@@ -256,6 +267,7 @@ class Worker:
                 f"still truncated at max split depth {task.depth}: {params.describe()}"
             )
         # sizing only helps the first, all-partner split; deeper levels bisect
+        self.board.phase("split", rows=len(result.records))
         est = self._estimate_rows(params) if params.partners is None else None
         children = split(
             params,
@@ -266,16 +278,70 @@ class Worker:
         )
         n = self.store.split_task(task, children)
         self.tasks_split += 1
+        self.board.task_end("split", wire=result.wire_bytes, note=f"{n} parts")
         log.info(
-            "task=%s truncated at cap=%d -> split into %d children (depth %d%s)",
+            "task=%s truncated at cap=%d -> split into %d children (depth %d%s) %s",
             task.task_id,
             result.cap,
             n,
             task.depth + 1,
             f", est≈{est / 1000:.0f}k rows" if est else "",
+            params.describe(),
         )
 
     # -- main loop --------------------------------------------------------------
+
+    def _attempt(self, task: Task, wait_quota: bool) -> bool:
+        """Execute one claimed task and settle it. False means stop the run."""
+        try:
+            self._execute(task)
+        except ShutdownRequested:
+            self.store.release_task(task.task_id)
+            self.board.task_end("released")
+            log.info("task=%s released (shutdown mid-task)", task.task_id)
+            return False
+        except QuotaExhausted as e:
+            self.store.release_task(task.task_id)
+            self.board.task_end("released", note=str(e))
+            if not wait_quota:
+                log.info("%s — exiting for the next scheduled run to resume", e)
+                return False
+            self._sleep_until_quota_reset()
+        except TransientError as e:
+            status = self.store.fail_task(
+                task.task_id,
+                str(e),
+                permanent=False,
+                max_attempts=self.cfg.retry.task_max_attempts,
+            )
+            self.tasks_failed += 1
+            self.board.task_end(status, note=str(e))
+            log.warning("task=%s transient failure (-> %s): %s", task.task_id, status, e)
+            if status == "failed":  # not dead, and not cancelled mid-flight
+                self._backoff(task.attempts, e.retry_after, str(e))
+        except (PermanentError, CannotSplit) as e:
+            self.store.fail_task(
+                task.task_id,
+                str(e),
+                permanent=True,
+                max_attempts=self.cfg.retry.task_max_attempts,
+            )
+            self.tasks_failed += 1
+            self.board.task_end("dead", note=str(e))
+            log.error("task=%s DEAD (permanent): %s", task.task_id, e)
+        except Exception as e:
+            # A bug must not lose the task or kill a weeks-long run.
+            status = self.store.fail_task(
+                task.task_id,
+                f"unexpected: {e!r}",
+                permanent=False,
+                max_attempts=self.cfg.retry.task_max_attempts,
+            )
+            self.tasks_failed += 1
+            self.board.task_end(status, note=f"unexpected: {e!r}")
+            log.exception("task=%s unexpected error (-> %s)", task.task_id, status)
+            self._backoff(task.attempts, None, f"unexpected: {e!r}")
+        return True
 
     def run(
         self,
@@ -287,63 +353,40 @@ class Worker:
     ) -> int:
         deadline = time.monotonic() + stop_after_hours * 3600 if stop_after_hours else None
         self.store.reset_stale_in_progress(None)  # sole worker: reclaim everything
-
-        while not self.shutdown.is_set():
-            if deadline and time.monotonic() >= deadline:
-                log.info("--stop-after reached")
-                break
-            if max_calls is not None and self.calls_made >= max_calls:
-                log.info("--max-calls reached (%d)", self.calls_made)
-                break
-
-            task = self.store.claim_next_task(job_id, kind=job_kind)
-            if task is None:
-                log.info("queue drained")
-                break
-
-            try:
-                self._execute(task)
-            except ShutdownRequested:
-                self.store.release_task(task.task_id)
-                log.info("task=%s released (shutdown mid-task)", task.task_id)
-                break
-            except QuotaExhausted as e:
-                self.store.release_task(task.task_id)
-                if not wait_quota:
-                    log.info("%s — exiting for the next scheduled run to resume", e)
+        log.info("worker start pid=%d job=%s kind=%s", os.getpid(), job_id or "*", job_kind or "*")
+        self.board.started(mode=job_kind or "run", job_id=job_id)
+        reason = "signal"
+        task = None
+        try:
+            while not self.shutdown.is_set():
+                if deadline and time.monotonic() >= deadline:
+                    log.info("--stop-after reached")
+                    reason = "stop-after"
                     break
-                self._sleep_until_quota_reset()
-            except TransientError as e:
-                status = self.store.fail_task(
-                    task.task_id,
-                    str(e),
-                    permanent=False,
-                    max_attempts=self.cfg.retry.task_max_attempts,
-                )
-                self.tasks_failed += 1
-                log.warning("task=%s transient failure (-> %s): %s", task.task_id, status, e)
-                if status != "dead":
-                    self._backoff(task.attempts, e.retry_after)
-            except (PermanentError, CannotSplit) as e:
-                self.store.fail_task(
-                    task.task_id,
-                    str(e),
-                    permanent=True,
-                    max_attempts=self.cfg.retry.task_max_attempts,
-                )
-                self.tasks_failed += 1
-                log.error("task=%s DEAD (permanent): %s", task.task_id, e)
-            except Exception as e:
-                # A bug must not lose the task or kill a weeks-long run.
-                status = self.store.fail_task(
-                    task.task_id,
-                    f"unexpected: {e!r}",
-                    permanent=False,
-                    max_attempts=self.cfg.retry.task_max_attempts,
-                )
-                self.tasks_failed += 1
-                log.exception("task=%s unexpected error (-> %s)", task.task_id, status)
-                self._backoff(task.attempts, None)
+                if max_calls is not None and self.calls_made >= max_calls:
+                    log.info("--max-calls reached (%d)", self.calls_made)
+                    reason = "max-calls"
+                    break
+
+                task = self.store.claim_next_task(job_id, kind=job_kind)
+                if task is None:
+                    log.info("queue drained")
+                    reason = "drained"
+                    break
+                self.board.task_begin(task)
+                if not self._attempt(task, wait_quota):
+                    reason = "signal" if self.shutdown.is_set() else "quota"
+                    break
+                task = None
+        except BaseException:
+            # A second signal (or a crash) lands here mid-task: hand the task back
+            # instead of leaving it in_progress until the next worker reclaims it.
+            if task is not None:
+                self.store.release_task(task.task_id)
+            reason = "aborted"
+            raise
+        finally:
+            self.board.stopped(reason)
 
         interrupted = self.shutdown.is_set()
         log.info(
@@ -365,7 +408,9 @@ def cmd_run(
     max_calls: int | None = None,
     stop_after_hours: float | None = None,
     wait_quota: bool = True,
+    live: bool = False,
 ) -> int:
+    """live=True draws the inline progress display (an interactive terminal)."""
     cfg.require_key()  # fail fast before touching state
     store = Store(cfg.paths.state_db)
     try:
@@ -373,13 +418,19 @@ def cmd_run(
             client = ComtradeClient(cfg)
             quota = QuotaLedger(store, cfg.quota)
             refs = Refs(client, cfg.paths.refs)
-            worker = Worker(cfg, store, client, quota, refs)
+            board = StatusBoard(cfg.paths.state_dir / STATUS_FILE)
+            worker = Worker(cfg, store, client, quota, refs, board)
             worker.install_signal_handlers()
-            return worker.run(
-                job_id=job_id,
-                max_calls=max_calls,
-                stop_after_hours=stop_after_hours,
-                wait_quota=wait_quota,
-            )
+            with ExitStack() as stack:
+                if live:
+                    from .ui.inline import InlineProgress
+
+                    stack.enter_context(InlineProgress(cfg, store, board, job_id=job_id))
+                return worker.run(
+                    job_id=job_id,
+                    max_calls=max_calls,
+                    stop_after_hours=stop_after_hours,
+                    wait_quota=wait_quota,
+                )
     finally:
         store.close()

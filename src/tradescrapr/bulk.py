@@ -29,6 +29,8 @@ def execute_bulk_task(worker: Worker, task: Task, params: TaskParams) -> None:
     if not worker.quota.try_reserve():
         raise QuotaExhausted(f"daily budget spent ({worker.quota.used_today()} calls)")
     worker.calls_made += 1
+    worker.board.call()
+    worker.board.phase("list")
     try:
         rows = worker.client.get_bulk_availability(
             dataset=params.dataset,
@@ -63,14 +65,20 @@ def execute_bulk_task(worker: Worker, task: Task, params: TaskParams) -> None:
     storage.remove_task_outputs(part_dir, task.task_id)
 
     tmp_gz = cfg.paths.state_dir / "tmp" / f"{task.task_id}.gz"
-    sha_gz = worker.client.download_file(file_url, tmp_gz, shutdown=worker.shutdown)
-    log.info("task=%s bulk file downloaded (%d bytes)", task.task_id, tmp_gz.stat().st_size)
+    worker.board.phase("download")
+    sha_gz = worker.client.download_file(
+        file_url, tmp_gz, shutdown=worker.shutdown, on_progress=worker.board.transfer
+    )
+    gz_bytes = tmp_gz.stat().st_size
+    log.info("task=%s bulk file downloaded (%d bytes)", task.task_id, gz_bytes)
 
+    worker.board.phase("convert")
     try:
         results = storage.convert_bulk_file(
             tmp_gz,
             part_dir=part_dir,
             task_id=task.task_id,
+            on_chunk=lambda n, rows: worker.board.note(f"{n} chunk(s) · {rows:,} rows written"),
             manifest_meta={
                 "dataset": params.dataset,
                 "source_url": file_url,
@@ -89,6 +97,7 @@ def execute_bulk_task(worker: Worker, task: Task, params: TaskParams) -> None:
     paths = [str(r.path.relative_to(cfg.paths.root)) for r in results]
     worker.store.finish_task(task.task_id, records=rows_total, paths=paths)
     worker.tasks_done += 1
+    worker.board.task_end("done", rows=rows_total, wire=gz_bytes)
     log.info(
         "task=%s job=%s bulk %s reporter=%s period=%s status=done records=%d chunks=%d",
         task.task_id,

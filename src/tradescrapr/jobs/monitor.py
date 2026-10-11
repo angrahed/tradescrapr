@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from contextlib import ExitStack
 
 from ..availability import ReleaseRow, fetch_availability
 from ..client import ComtradeClient
 from ..config import Config
+from ..livestatus import STATUS_FILE, StatusBoard
 from ..planner import TaskParams
 from ..quota import QuotaLedger
 from ..refs import Refs
@@ -66,7 +68,9 @@ def _monitor_tasks(cfg: Config, row: ReleaseRow) -> list[TaskParams]:
     ]
 
 
-def cmd_monitor(cfg: Config, *, dry_run: bool = False, wait_quota: bool = False) -> int:
+def cmd_monitor(
+    cfg: Config, *, dry_run: bool = False, wait_quota: bool = False, live: bool = False
+) -> int:
     mon = cfg.monitor
     if not dry_run:
         cfg.require_key()
@@ -154,9 +158,15 @@ def cmd_monitor(cfg: Config, *, dry_run: bool = False, wait_quota: bool = False)
                 log.info("monitor: no new releases; draining any leftover tasks")
 
             quota = QuotaLedger(store, cfg.quota)
-            worker = Worker(cfg, store, client, quota, refs)
+            board = StatusBoard(cfg.paths.state_dir / STATUS_FILE)
+            worker = Worker(cfg, store, client, quota, refs, board)
             worker.install_signal_handlers()
-            rc = worker.run(job_kind="monitor", wait_quota=wait_quota or mon.wait_for_quota)
+            with ExitStack() as stack:
+                if live:
+                    from ..ui.inline import InlineProgress
+
+                    stack.enter_context(InlineProgress(cfg, store, board, kind="monitor"))
+                rc = worker.run(job_kind="monitor", wait_quota=wait_quota or mon.wait_for_quota)
 
             finalized = store.finalize_releases()
 

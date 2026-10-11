@@ -3,10 +3,12 @@
 import datetime as dt
 
 import polars as pl
+import pytest
 
 from tradescrapr.client import FetchResult
 from tradescrapr.config import QuotaConfig
 from tradescrapr.errors import PermanentError, QuotaExhausted, TransientError
+from tradescrapr.livestatus import StatusBoard, read_status
 from tradescrapr.planner import TaskParams
 from tradescrapr.quota import QuotaLedger
 from tradescrapr.worker import Worker
@@ -20,11 +22,14 @@ class FakeClient:
         self.calls = 0
         self.availability = availability or []
 
-    def get_data(self, **_kw):
+    def get_data(self, on_progress=None, **_kw):
         self.calls += 1
         action = self.script.pop(0)
-        if isinstance(action, Exception):
+        if isinstance(action, BaseException):
             raise action
+        if on_progress:
+            on_progress("headers", 0, 100)
+            on_progress("done", 100, 100)
         return action
 
     def get_availability(self, **_kw):
@@ -58,11 +63,11 @@ def _params(flow="M", **kw):
     return TaskParams(**base)
 
 
-def _worker(cfg, store, refs, script, budget=10, availability=None):
+def _worker(cfg, store, refs, script, budget=10, availability=None, board=None):
     quota = QuotaLedger(
         store, QuotaConfig(daily_budget=budget, reset_time=dt.time(0, 0), reset_tz="UTC")
     )
-    return Worker(cfg, store, FakeClient(script, availability), quota, refs)
+    return Worker(cfg, store, FakeClient(script, availability), quota, refs, board)
 
 
 def _seed(store, params_list):
@@ -200,3 +205,71 @@ def test_monitor_cleanup_wipes_partition_once_per_job(cfg, store, refs):
     new_files = set(p.name for p in part.glob("part-*.parquet"))
     assert not (old_files & new_files)
     assert len(new_files) == 2
+
+
+def test_status_board_tracks_the_run(cfg, store, refs):
+    _seed(store, [_params(flow="M"), _params(flow="X")])
+    path = cfg.paths.state_dir / "worker.json"
+    board = StatusBoard(path)
+    phases = []
+    original = board.phase
+    board.phase = lambda name, **kw: (phases.append(name), original(name, **kw))[1]
+    w = _worker(cfg, store, refs, [TransientError("503"), _result(4), _result(2)], board=board)
+    assert w.run() == 0
+    doc = read_status(path)
+    assert doc["state"] == "stopped" and doc["reason"] == "drained"
+    s = doc["session"]
+    assert (s["calls"], s["done"], s["failed"], s["rows"]) == (3, 2, 1, 6)
+    assert phases.count("request") == 3 and phases.count("write") == 2
+    assert doc["last"]["outcome"] == "done" and doc["last"]["rows"] in (2, 4)
+
+
+def test_hard_exit_returns_the_task_to_the_queue(cfg, store, refs):
+    # a second SIGTERM raises SystemExit from the signal handler mid-call
+    _seed(store, [_params()])
+    board = StatusBoard(None)
+    w = _worker(cfg, store, refs, [SystemExit(130)], board=board)
+    with pytest.raises(SystemExit):
+        w.run()
+    assert store.job_progress("j1")[0].counts == {"pending": 1}
+    doc = board.snapshot()
+    assert doc["state"] == "stopped" and doc["reason"] == "aborted"
+
+
+def test_shutdown_wakes_a_sleeping_worker(cfg, store, refs):
+    w = _worker(cfg, store, refs, [])
+    w.shutdown.set()
+    t0 = dt.datetime.now()
+    w._sleep(60)
+    assert (dt.datetime.now() - t0).total_seconds() < 1
+
+
+def test_a_failing_status_listener_cannot_fail_a_finished_task(cfg, store, refs):
+    _seed(store, [_params()])
+    board = StatusBoard(None)
+
+    def broken(event):
+        raise RuntimeError("display trouble")
+
+    board.subscribe(broken)
+    w = _worker(cfg, store, refs, [_result(3)], board=board)
+    assert w.run() == 0
+    assert store.job_progress("j1")[0].counts == {"done": 1}
+    assert w.client.calls == 1
+
+
+def test_cancelled_mid_flight_stays_cancelled(cfg, store, refs):
+    _seed(store, [_params(flow="M")])
+
+    class CancelThenFail(FakeClient):
+        def get_data(self, on_progress=None, **kw):
+            store.cancel_job("j1")  # the dashboard's C lands while the call is in flight
+            return super().get_data(on_progress=on_progress, **kw)
+
+    quota = QuotaLedger(
+        store, QuotaConfig(daily_budget=10, reset_time=dt.time(0, 0), reset_tz="UTC")
+    )
+    w = Worker(cfg, store, CancelThenFail([_result(100)]), quota, refs)
+    assert w.run() == 0
+    # truncated, but the parent was cancelled: no children, nothing left to fetch
+    assert store.job_progress("j1")[0].counts == {"cancelled": 1}

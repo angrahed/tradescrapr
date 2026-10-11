@@ -190,3 +190,53 @@ def test_delete_job_removes_rows_and_leaves_siblings(store):
     # the untouched sibling job and its task survive
     assert store.get_job("keep") is not None
     assert store.claim_next_task(job_id="keep").task_id == parent_ids[0]
+
+
+def test_fail_task_leaves_a_cancelled_task_alone(store):
+    from tradescrapr.planner import TaskParams
+
+    p = TaskParams(
+        dataset="final",
+        type_code="C",
+        freq="A",
+        cl_code="HS",
+        reporter="8",
+        period="2022",
+        flows=("M",),
+        cmd_level=6,
+        cmd_codes=None,
+        partners=None,
+    )
+    store.create_job("j", "targeted", "{}")
+    store.add_tasks("j", [p])
+    t = store.claim_next_task()
+    store.cancel_job("j")
+    assert store.fail_task(t.task_id, "503", permanent=False, max_attempts=5) == "cancelled"
+    assert store.split_task(t, [p]) == 0
+    assert store.job_progress("j")[0].counts == {"cancelled": 1}
+
+
+def test_next_tasks_follows_the_worker_filters(store):
+    from tradescrapr.planner import TaskParams
+
+    def p(rep):
+        return TaskParams(
+            dataset="final",
+            type_code="C",
+            freq="A",
+            cl_code="HS",
+            reporter=rep,
+            period="2022",
+            flows=("M",),
+            cmd_level=6,
+            cmd_codes=None,
+            partners=None,
+        )
+
+    store.create_job("old", "targeted", "{}")
+    store.add_tasks("old", [p("8")])
+    store.create_job("mon", "monitor", "{}")
+    store.add_tasks("mon", [p("276")])
+    assert {r["job_id"] for r in store.next_tasks()} == {"old", "mon"}
+    assert [r["job_id"] for r in store.next_tasks(job_id="mon")] == ["mon"]
+    assert [r["job_id"] for r in store.next_tasks(kind="monitor")] == ["mon"]

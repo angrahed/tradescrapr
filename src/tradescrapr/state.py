@@ -59,6 +59,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_tasks_dedup      ON tasks(job_id, params_ha
 CREATE INDEX IF NOT EXISTS ix_tasks_claim             ON tasks(status, attempts, created_at);
 CREATE INDEX IF NOT EXISTS ix_tasks_job_status        ON tasks(job_id, status);
 CREATE INDEX IF NOT EXISTS ix_tasks_partition         ON tasks(dataset, freq, period, reporter);
+CREATE INDEX IF NOT EXISTS ix_tasks_finished          ON tasks(finished_at);
 
 CREATE TABLE IF NOT EXISTS quota_ledger (
   quota_date TEXT PRIMARY KEY,
@@ -307,21 +308,34 @@ class Store:
             )
 
     def fail_task(self, task_id: str, error: str, *, permanent: bool, max_attempts: int) -> str:
+        """Record a failed attempt; returns the task's resulting status. Only an
+        in_progress task changes: one cancelled (or superseded) mid-flight stays
+        cancelled instead of re-entering the queue as 'failed'."""
         with self.db:
             row = self.db.execute(
-                "SELECT attempts FROM tasks WHERE task_id=?", (task_id,)
+                "SELECT attempts, status FROM tasks WHERE task_id=?", (task_id,)
             ).fetchone()
+            if row is not None and row["status"] != "in_progress":
+                return str(row["status"])
             attempts = row["attempts"] if row else 0
             status = "dead" if permanent or attempts >= max_attempts else "failed"
             self.db.execute(
-                "UPDATE tasks SET status=?, last_error=?, finished_at=? WHERE task_id=?",
+                """UPDATE tasks SET status=?, last_error=?, finished_at=?
+                   WHERE task_id=? AND status='in_progress'""",
                 (status, error[:2000], _now() if status == "dead" else None, task_id),
             )
         return status
 
     def split_task(self, task: Task, children: Sequence[TaskParams]) -> int:
-        """Atomically insert split children and retire the parent."""
+        """Atomically insert split children and retire the parent. A parent
+        cancelled while it was in flight gets no children, so cancelling a job
+        really stops it."""
         with self.db:
+            row = self.db.execute(
+                "SELECT status FROM tasks WHERE task_id=?", (task.task_id,)
+            ).fetchone()
+            if row is not None and row["status"] != "in_progress":
+                return 0
             n = self._insert_task_rows(
                 task.job_id, children, parent_task_id=task.task_id, depth=task.depth + 1
             )
@@ -426,10 +440,92 @@ class Store:
 
     def in_progress_tasks(self, limit: int = 5) -> list[sqlite3.Row]:
         return self.db.execute(
-            """SELECT task_id, job_id, dataset, freq, period, reporter, claimed_at
+            """SELECT task_id, job_id, dataset, freq, period, reporter, claimed_at,
+                      attempts, depth, params_json
                FROM tasks WHERE status='in_progress'
                ORDER BY claimed_at DESC LIMIT ?""",
             (limit,),
+        ).fetchall()
+
+    def next_tasks(
+        self, limit: int = 12, job_id: str | None = None, kind: str | None = None
+    ) -> list[sqlite3.Row]:
+        """The queue head, in the order a worker with the same filters claims it."""
+        return self.db.execute(
+            """SELECT task_id, job_id, reporter, period, attempts, params_json
+               FROM tasks t WHERE t.status IN ('pending','failed')
+                 AND (:job_id IS NULL OR t.job_id = :job_id)
+                 AND (:kind IS NULL OR t.job_id IN (SELECT job_id FROM jobs WHERE kind = :kind))
+               ORDER BY t.attempts ASC, t.created_at ASC, t.task_id ASC LIMIT :limit""",
+            {"limit": limit, "job_id": job_id, "kind": kind},
+        ).fetchall()
+
+    def jobs(self) -> list[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT job_id, kind, status, created_at, spec_json FROM jobs ORDER BY created_at"
+        ).fetchall()
+
+    def pace(self, job_ids: Sequence[str]) -> list[sqlite3.Row]:
+        """Mean seconds per settled task, per (job, reporter): claim to finish of
+        the attempt that settled it. Feeds ETAs and the in-flight estimate."""
+        if not job_ids:
+            return []
+        marks = ",".join("?" * len(job_ids))
+        return self.db.execute(
+            f"""SELECT job_id, reporter, COUNT(*) AS n,
+                       AVG((julianday(finished_at) - julianday(claimed_at)) * 86400.0) AS secs
+                FROM tasks
+                WHERE job_id IN ({marks}) AND status IN ('done','split')
+                  AND claimed_at IS NOT NULL AND finished_at IS NOT NULL
+                GROUP BY job_id, reporter""",
+            tuple(job_ids),
+        ).fetchall()
+
+    def backlog(self) -> list[sqlite3.Row]:
+        """Unsettled task counts per (job, reporter)."""
+        return self.db.execute(
+            """SELECT job_id, reporter, COUNT(*) AS n FROM tasks
+               WHERE status IN ('pending','failed','in_progress')
+               GROUP BY job_id, reporter"""
+        ).fetchall()
+
+    def finished_since(self, since_iso: str) -> list[sqlite3.Row]:
+        return self.db.execute(
+            """SELECT job_id, claimed_at, finished_at, records_fetched FROM tasks
+               WHERE finished_at >= ? AND status IN ('done','split')
+               ORDER BY finished_at""",
+            (since_iso,),
+        ).fetchall()
+
+    def problem_tasks(self, job_id: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        """Dead tasks first, then ones waiting on a retry; newest first."""
+        return self.db.execute(
+            """SELECT task_id, job_id, status, dataset, freq, period, reporter, attempts,
+                      last_error, params_json
+               FROM tasks WHERE status IN ('dead','failed')
+                 AND (:job_id IS NULL OR job_id=:job_id)
+               ORDER BY status='dead' DESC, COALESCE(finished_at, claimed_at) DESC
+               LIMIT :limit""",
+            {"job_id": job_id, "limit": limit},
+        ).fetchall()
+
+    def coverage(self, job_id: str) -> list[sqlite3.Row]:
+        """Task states per reporter x period for one job (the detail view's map)."""
+        return self.db.execute(
+            """SELECT reporter, period, status, COUNT(*) AS n,
+                      COALESCE(SUM(records_fetched), 0) AS recs
+               FROM tasks WHERE job_id=? GROUP BY reporter, period, status""",
+            (job_id,),
+        ).fetchall()
+
+    def outputs_since(self, since_iso: str | None) -> list[sqlite3.Row]:
+        """(job_id, output_paths) for tasks that wrote files, optionally only
+        those finished since a timestamp — the dashboard sizes data per job."""
+        return self.db.execute(
+            """SELECT job_id, output_paths FROM tasks
+               WHERE output_paths IS NOT NULL AND output_paths NOT IN ('', '[]')
+                 AND (:since IS NULL OR finished_at >= :since)""",
+            {"since": since_iso},
         ).fetchall()
 
     # -- quota ledger -----------------------------------------------------------
